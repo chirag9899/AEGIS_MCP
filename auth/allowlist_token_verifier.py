@@ -1,4 +1,4 @@
-"""Token verifier wrapper that enforces WORKSPACE_MCP_ALLOWED_USER_EMAILS."""
+"""Token verifier wrapper that enforces the user email allowlist."""
 
 from __future__ import annotations
 
@@ -20,9 +20,12 @@ class AllowlistTokenVerifier:
     def required_scopes(self):
         return self._inner.required_scopes
 
-    async def verify_token(self, token: str):
+    async def verify_token(self, token: str) -> Optional[Any]:
         result = await self._inner.verify_token(token)
-        if result is None or get_allowed_user_emails() is None:
+        if result is None:
+            return None
+
+        if get_allowed_user_emails() is None:
             return result
 
         email = getattr(result, "email", None)

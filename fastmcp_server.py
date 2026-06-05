@@ -171,7 +171,7 @@ set_enabled_tool_names(None)  # Don't filter individual tools - enable all
 # Filter tools based on configuration
 filter_server_tools(server)
 
-# Configure authentication after scopes are known
+# Configure authentication
 configure_server_for_http()
 
 # Export server instance for FastMCP CLI (looks for 'mcp', 'server', or 'app')

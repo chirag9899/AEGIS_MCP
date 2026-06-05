@@ -15,6 +15,12 @@ from auth.external_oauth_provider import get_session_time
 from auth.oauth21_session_store import ensure_session_from_access_token
 from auth.oauth_types import WorkspaceAccessToken
 from auth.user_allowlist import check_user_email_allowed
+from auth.device_key_registry import (
+    is_device_key_enforcement_enabled,
+    validate_device_key,
+    is_key_pending,
+    bind_device_key,
+)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -30,11 +36,42 @@ class AuthInfoMiddleware(Middleware):
         super().__init__()
         self.auth_provider_type = "GoogleProvider"
 
-    def _enforce_user_allowlist(self, user_email: str) -> None:
+    def _enforce_user_allowlist(self, user_email: str, device_key: str | None = None) -> None:
         reason = check_user_email_allowed(user_email)
         if reason:
             logger.warning("Allowlist denied MCP access for %s", user_email)
             raise AuthorizationError(reason)
+
+        if is_device_key_enforcement_enabled():
+            if not device_key:
+                raise AuthorizationError(
+                    "Access denied: no device key provided. "
+                    "Run the onboarding script: curl -fsSL https://aegis.infrasingularity.com/install.sh | bash"
+                )
+
+            if not validate_device_key(user_email, device_key):
+                # Key not bound yet — check if it's a fresh pending key and auto-bind it
+                if is_key_pending(device_key):
+                    if bind_device_key(device_key, user_email):
+                        logger.info(
+                            "Auto-bound device key %s... to %s on first login",
+                            device_key[:8], user_email,
+                        )
+                        # Key is now bound; fall through to normal flow
+                    else:
+                        raise AuthorizationError(
+                            f"Access denied: could not bind device to {user_email}. "
+                            "Ensure your email is on the allowed list."
+                        )
+                else:
+                    logger.warning(
+                        "Device key rejected for %s (key=%s...)",
+                        user_email, device_key[:8],
+                    )
+                    raise AuthorizationError(
+                        f"Access denied: unrecognized or expired device key for {user_email}. "
+                        "Run the onboarding script again to register this device."
+                    )
 
     async def _process_request_for_auth(self, context: MiddlewareContext):
         """Helper to extract, verify, and store auth info from a request."""
@@ -79,11 +116,6 @@ class AuthInfoMiddleware(Middleware):
         # Try to get the HTTP request to extract Authorization header
         if not authenticated_user:
             try:
-                # Capture the full headers for diagnostics, then scope auth parsing to authorization.
-                all_headers = get_http_headers()
-                logger.info(
-                    f"[AuthInfoMiddleware] get_http_headers() returned: {all_headers is not None}, keys: {list(all_headers.keys()) if all_headers else 'None'}"
-                )
                 headers = get_http_headers(include={"authorization"})
                 if headers:
                     logger.debug("Processing HTTP headers for authentication")
@@ -335,7 +367,14 @@ class AuthInfoMiddleware(Middleware):
 
         # Single exit point with logging
         if authenticated_user:
-            self._enforce_user_allowlist(authenticated_user)
+            device_key: str | None = None
+            try:
+                dk_headers = get_http_headers(include={"x-device-key"})
+                if dk_headers:
+                    device_key = dk_headers.get("x-device-key")
+            except Exception:
+                pass
+            self._enforce_user_allowlist(authenticated_user, device_key=device_key)
             logger.info(f"✓ Authenticated via {auth_via}: {authenticated_user}")
             auth_email = await context.fastmcp_context.get_state(
                 "authenticated_user_email"

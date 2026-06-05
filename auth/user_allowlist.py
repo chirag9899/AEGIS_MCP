@@ -54,11 +54,7 @@ def log_allowlist_configuration() -> None:
     """Log the active allowlist once at startup."""
     allowed = get_allowed_user_emails()
     if allowed is None:
-        logger.info(
-            "OAuth user allowlist disabled (WORKSPACE_MCP_ALLOWED_USER_EMAILS not set)"
-        )
+        logger.info("OAuth user allowlist disabled (WORKSPACE_MCP_ALLOWED_USER_EMAILS not set)")
         return
-    logger.info(
-        "OAuth user allowlist enabled for: %s",
-        ", ".join(sorted(allowed)),
-    )
+    logger.info("OAuth user allowlist enabled for: %s", ", ".join(sorted(allowed)))
+    logger.info("Device key enforcement handles per-device isolation (see WORKSPACE_MCP_DEVICE_KEY_ENFORCEMENT)")

@@ -23,31 +23,31 @@ class WorkspaceGoogleProvider(GoogleProvider):
             self._token_validator = AllowlistTokenVerifier(self._token_validator)
 
     async def exchange_authorization_code(self, client, authorization_code):
-        """Block token issuance during OAuth when the Google account is not allowed."""
-        allowed = get_allowed_user_emails()
-        if allowed is not None:
-            code_model = await self._code_store.get(key=authorization_code.code)
-            if not code_model:
-                raise TokenError("invalid_grant", "Authorization code not found")
+        """Block token issuance during OAuth when the Google account is not on the allowlist."""
+        if get_allowed_user_emails() is None:
+            return await super().exchange_authorization_code(client, authorization_code)
 
-            access_token = code_model.idp_tokens.get("access_token")
-            if not access_token:
-                raise TokenError("invalid_grant", "Missing upstream access token")
+        code_model = await self._code_store.get(key=authorization_code.code)
+        if not code_model:
+            raise TokenError("invalid_grant", "Authorization code not found")
 
-            inner_verifier = getattr(self._token_validator, "_inner", self._token_validator)
-            validated = await inner_verifier.verify_token(access_token)
-            if not validated:
-                raise TokenError("invalid_grant", "Could not verify upstream access token")
+        access_token = code_model.idp_tokens.get("access_token")
+        if not access_token:
+            raise TokenError("invalid_grant", "Missing upstream access token")
 
-            email = getattr(validated, "email", None)
-            claims = getattr(validated, "claims", None) or {}
-            if not email and isinstance(claims, dict):
-                email = claims.get("email")
+        inner_verifier = getattr(self._token_validator, "_inner", self._token_validator)
+        validated = await inner_verifier.verify_token(access_token)
+        if not validated:
+            raise TokenError("invalid_grant", "Could not verify upstream access token")
 
-            reason = check_user_email_allowed(email)
-            if reason:
-                logger.warning("Allowlist rejected OAuth exchange for %s", email)
-                # Token endpoint only accepts RFC 6749 error codes; use invalid_grant.
-                raise TokenError("invalid_grant", reason)
+        email = getattr(validated, "email", None)
+        claims = getattr(validated, "claims", None) or {}
+        if not email and isinstance(claims, dict):
+            email = claims.get("email")
+
+        reason = check_user_email_allowed(email)
+        if reason:
+            logger.warning("Allowlist rejected OAuth exchange for %s", email)
+            raise TokenError("invalid_grant", reason)
 
         return await super().exchange_authorization_code(client, authorization_code)

@@ -120,18 +120,21 @@ class ExternalOAuthProvider(WorkspaceGoogleProvider):
                 user_info = get_user_info(credentials, skip_valid_check=True)
 
                 if user_info and user_info.get("email"):
-                    reason = check_user_email_allowed(user_info["email"])
+                    email = user_info["email"]
+                    reason = check_user_email_allowed(email)
                     if reason:
                         logger.warning(
                             "Allowlist rejected external access token for %s",
-                            user_info["email"],
+                            email,
                         )
                         return None
+                    # Device binding is enforced at OAuth exchange time (workspace_google_provider.py),
+                    # not here. self._client_id is the GCP client ID, not the Claude client UUID.
 
                     session_time = get_session_time()
                     # Token is valid - create AccessToken object
                     logger.info(
-                        f"Validated external access token for: {user_info['email']}"
+                        f"Validated external access token for: {email}"
                     )
 
                     scope_list = list(getattr(self, "required_scopes", []) or [])
@@ -144,7 +147,7 @@ class ExternalOAuthProvider(WorkspaceGoogleProvider):
                             "sub": user_info.get("id"),
                         },
                         client_id=self._client_id,
-                        email=user_info["email"],
+                        email=email,
                         sub=user_info.get("id"),
                     )
                     return access_token

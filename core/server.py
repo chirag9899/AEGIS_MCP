@@ -29,6 +29,7 @@ from auth.oauth_responses import (
     create_server_error_response,
 )
 from auth.auth_info_middleware import AuthInfoMiddleware
+from auth.resource_alias_middleware import OIDCFieldsMiddleware, ResourceAliasMiddleware
 from auth.scopes import PROTOCOL_AUTH_SCOPES, SCOPES, get_current_scopes  # noqa
 from core.config import (
     USER_GOOGLE_EMAIL,
@@ -44,6 +45,8 @@ _auth_provider: Optional[GoogleProvider] = None
 _legacy_callback_registered = False
 
 session_middleware = Middleware(MCPSessionMiddleware)
+resource_alias_middleware = Middleware(ResourceAliasMiddleware)
+oidc_fields_middleware = Middleware(OIDCFieldsMiddleware)
 
 
 class WellKnownCacheControlMiddleware:
@@ -94,14 +97,19 @@ class SecureFastMCP(FastMCP):
         app = super().http_app(**kwargs)
 
         # Add middleware in order (first added = outermost layer)
-        app.user_middleware.insert(0, well_known_cache_control_middleware)
-
-        # Session Management - extracts session info for MCP context
-        app.user_middleware.insert(1, session_middleware)
+        # 0: ResourceAliasMiddleware   – rewrites WWW-Authenticate/Location headers per-alias
+        app.user_middleware.insert(0, resource_alias_middleware)
+        # 1: OIDCFieldsMiddleware      – injects jwks_uri/subject_types/id_token_alg into
+        #                               oauth-authorization-server JSON body (required by mcp-remote ≥0.1.38)
+        app.user_middleware.insert(1, oidc_fields_middleware)
+        # 2: WellKnownCacheControlMiddleware – no-cache for discovery endpoints
+        app.user_middleware.insert(2, well_known_cache_control_middleware)
+        # 3: Session Management        – extracts session info for MCP context
+        app.user_middleware.insert(3, session_middleware)
 
         # Rebuild middleware stack
         app.middleware_stack = app.build_middleware_stack()
-        logger.info("Added middleware stack: WellKnownCacheControl, Session Management")
+        logger.info("Added middleware stack: ResourceAlias, OIDCFields, WellKnownCacheControl, SessionManagement")
         return app
 
     async def list_tools(self, *, run_middleware: bool = True):
@@ -743,3 +751,79 @@ async def start_google_auth(
     except Exception as e:
         logger.error(f"Failed to start Google authentication flow: {e}", exc_info=True)
         return f"**Error:** An unexpected error occurred: {e}"
+
+
+# ── Device registration endpoints ────────────────────────────────────────────
+import os as _os
+
+_MCP_PUBLIC_URL = "https://aegis.infrasingularity.com/google/mcp"
+
+
+@server.custom_route("/device/register", methods=["POST"])
+async def device_register(request: Request):
+    import hmac as _hmac
+    from auth.device_key_registry import register_pending_device
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    fingerprint = (body.get("fingerprint") or "unknown").strip()[:200]
+    label = (body.get("label") or fingerprint[:40]).strip()[:80]
+    reg_secret = (body.get("registration_secret") or "").strip()
+
+    # Optional registration secret — set AEGIS_REGISTRATION_SECRET in .env to restrict
+    # who can issue new device keys (recommended for production).
+    required_secret = _os.environ.get("AEGIS_REGISTRATION_SECRET", "")
+    if required_secret:
+        if not reg_secret:
+            return JSONResponse({"error": "registration_secret required"}, status_code=403)
+        if not _hmac.compare_digest(reg_secret, required_secret):
+            return JSONResponse({"error": "invalid registration_secret"}, status_code=403)
+
+    entry = register_pending_device(fingerprint, label)
+    key = entry["key"]
+
+    claude_config = {
+        "mcpServers": {
+            "aegis-google": {"url": _MCP_PUBLIC_URL}
+        }
+    }
+
+    return JSONResponse({
+        "key": key,
+        "mcp_url": _MCP_PUBLIC_URL,
+        "label": label,
+        "claude_desktop_config": claude_config,
+        "instructions": (
+            "Add the 'mcpServers' block from claude_desktop_config to:\n"
+            "  Mac:     ~/Library/Application Support/Claude/claude_desktop_config.json\n"
+            "  Windows: %APPDATA%\\Claude\\claude_desktop_config.json\n"
+            "  Linux:   ~/.config/claude/claude_desktop_config.json\n"
+            "\nYour email will be auto-detected when you sign in with Google."
+        ),
+    })
+
+
+@server.custom_route("/device/list", methods=["GET"])
+async def device_list(request: Request):
+    from auth.device_key_registry import list_devices
+
+    email = (request.query_params.get("email") or "").strip().lower()
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    return JSONResponse({"email": email, "devices": list_devices(email)})
+
+
+@server.custom_route("/install.sh", methods=["GET"])
+async def serve_install_script(request: Request):
+    """Serve the device onboarding script."""
+    import pathlib
+    script_path = pathlib.Path(__file__).parent.parent / "scripts" / "install_device.sh"
+    try:
+        content = script_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Response("# install script not found", status_code=404, media_type="text/plain")
+    from starlette.responses import Response as _Resp
+    return _Resp(content=content, media_type="text/plain; charset=utf-8")
