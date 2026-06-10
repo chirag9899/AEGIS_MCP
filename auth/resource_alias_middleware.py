@@ -62,19 +62,29 @@ class ResourceAliasMiddleware:
 
 
 class OIDCFieldsMiddleware:
-    """Inject required OIDC discovery fields into /.well-known/oauth-authorization-server responses.
+    """Inject OIDC fields and rewrite canonical google-mcp URLs in OAuth discovery JSON.
 
-    mcp-remote 0.1.38+ validates the auth-server metadata with a Zod schema that requires
-    jwks_uri, subject_types_supported, and id_token_signing_alg_values_supported.  FastMCP's
-    OAuthMetadata model does not include these fields, so we inject them here.  Nginx's
-    sub_filter will subsequently rewrite any canonical google-mcp URLs to per-alias URLs.
+    Handles:
+    - /.well-known/oauth-authorization-server
+    - /.well-known/oauth-protected-resource/...
+
+    When nginx forwards X-Forwarded-Prefix: /google, rewrites google-mcp → google so
+    mcp-remote sees resource https://.../google/mcp (not google-mcp/mcp).
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not scope.get("path", "").endswith("oauth-authorization-server"):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if not (
+            path.endswith("oauth-authorization-server")
+            or "oauth-protected-resource" in path
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -96,21 +106,20 @@ class OIDCFieldsMiddleware:
         if status_code == 200:
             try:
                 data = _json.loads(body)
-                issuer = str(data.get("issuer", ""))
-                # Inject missing OIDC fields (setdefault = only if absent)
-                data.setdefault("jwks_uri", f"{issuer}/jwks")
-                data.setdefault("subject_types_supported", ["public"])
-                data.setdefault("id_token_signing_alg_values_supported", ["RS256"])
-                body = _json.dumps(data).encode()
-                # If an alias prefix was forwarded, rewrite canonical google-mcp URLs in body
+                if path.endswith("oauth-authorization-server"):
+                    issuer = str(data.get("issuer", ""))
+                    data.setdefault("jwks_uri", f"{issuer}/jwks")
+                    data.setdefault("subject_types_supported", ["public"])
+                    data.setdefault("id_token_signing_alg_values_supported", ["RS256"])
+                    body = _json.dumps(data).encode()
+
                 prefix = _header_value(scope, b"x-forwarded-prefix").strip(b"/")
                 if prefix and prefix != b"google-mcp":
                     body = body.replace(b"/google-mcp", b"/" + prefix)
-                logger.debug("Injected OIDC fields into oauth-authorization-server response")
+                logger.debug("Rewrote OAuth discovery JSON for prefix /%s", prefix.decode() or "none")
             except Exception as exc:
-                logger.warning("OIDCFieldsMiddleware: failed to inject fields: %s", exc)
+                logger.warning("OIDCFieldsMiddleware: failed to process discovery JSON: %s", exc)
 
-        # Rebuild headers with correct content-length
         new_headers = [(k, v) for k, v in resp_headers if k.lower() != b"content-length"]
         new_headers.append((b"content-length", str(len(body)).encode()))
 

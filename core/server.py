@@ -200,6 +200,22 @@ def _parse_allowed_redirect_uris(value: Optional[str]) -> Optional[List[str]]:
     return uris or None
 
 
+def _parse_resource_base_url(value: Optional[str]) -> Optional[str]:
+    """Derive OAuth resource/issuer base URL from WORKSPACE_MCP_ACCEPTED_RESOURCE_ALIASES.
+
+    Clients connect at the public nginx alias (e.g. /google/mcp) while
+    WORKSPACE_EXTERNAL_URL keeps the canonical GCP redirect URI (/google-mcp).
+    """
+    if not value:
+        return None
+    url = value.split(",")[0].strip()
+    for suffix in ("/mcp/", "/mcp"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+            break
+    return url.rstrip("/") or None
+
+
 def set_transport_mode(mode: str):
     """Sets the transport mode for the server."""
     _set_transport_mode(mode)
@@ -519,10 +535,20 @@ def configure_server_for_http():
                         allowed_client_redirect_uris,
                     )
                 log_allowlist_configuration()
+                public_resource_base = _parse_resource_base_url(
+                    os.getenv("WORKSPACE_MCP_ACCEPTED_RESOURCE_ALIASES")
+                )
+                if public_resource_base:
+                    logger.info(
+                        "OAuth 2.1: public MCP resource/issuer base URL: %s",
+                        public_resource_base,
+                    )
                 provider = WorkspaceGoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
                     base_url=config.get_oauth_base_url(),
+                    resource_base_url=public_resource_base,
+                    issuer_url=public_resource_base or config.get_oauth_base_url(),
                     redirect_path=config.redirect_path,
                     required_scopes=provider_required_scopes,
                     valid_scopes=provider_valid_scopes,
