@@ -21,6 +21,12 @@ class WorkspaceGoogleProvider(GoogleProvider):
         super().__init__(*args, **kwargs)
         if get_allowed_user_emails() is not None:
             self._token_validator = AllowlistTokenVerifier(self._token_validator)
+        # Set FastMCP access token TTL to 30 days (matching refresh token lifetime).
+        # Upstream Google tokens are refreshed transparently server-side, so the client's
+        # FastMCP JWT never needs to be exchanged via a refresh_token grant under normal use.
+        # This prevents the 401 loop: expired access token → failed refresh → invalidateCredentials
+        # → zombie mcp-remote processes competing for the callback port.
+        self._min_fastmcp_access_token_expiry_seconds = 30 * 24 * 60 * 60  # 30 days
 
     async def exchange_authorization_code(self, client, authorization_code):
         """Block token issuance during OAuth when the Google account is not on the allowlist."""

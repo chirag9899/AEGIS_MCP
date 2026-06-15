@@ -5,6 +5,7 @@ Unit tests for Google Chat MCP tools — attachment support
 import asyncio
 import base64
 import inspect
+import json
 import ssl
 from urllib.parse import urlparse
 
@@ -707,3 +708,131 @@ async def test_download_returns_error_on_failure():
 
     assert "Failed to download" in result
     assert "connection refused" in result
+
+
+# ---------------------------------------------------------------------------
+# space discovery helpers / find_chat_space / get_space
+# ---------------------------------------------------------------------------
+
+
+def test_extract_space_id_from_gmail_chat_url():
+    from gchat.space_discovery import extract_space_id_from_url
+
+    url = "https://mail.google.com/mail/u/5/#chat/space/AAQA1k9BNCE"
+    assert extract_space_id_from_url(url) == "AAQA1k9BNCE"
+
+
+def test_build_display_name_candidates_for_daily_sync_jun_11():
+    from gchat.space_discovery import build_display_name_candidates
+
+    candidates = build_display_name_candidates("Daily Sync Jun 11")
+    assert "Daily Sync - Jun 11" in candidates
+    assert "Daily Sync – Jun 11" in candidates
+
+
+def test_build_admin_search_query_joins_display_name_candidates():
+    from gchat.chat_tools import _build_admin_search_query
+
+    query = _build_admin_search_query(
+        ["Daily Sync - Jun 11", "Daily Sync – Jun 11", "Daily Sync Jun 11"]
+    )
+    assert 'customer = "customers/my_customer"' in query
+    assert 'spaceType = "SPACE"' in query
+    assert 'displayName:"Daily Sync - Jun 11"' in query
+
+
+@pytest.mark.asyncio
+async def test_admin_search_spaces_filters_results():
+    from gchat.chat_tools import _admin_search_spaces
+
+    chat_service = Mock()
+    chat_service.spaces().search().execute.return_value = {
+        "spaces": [
+            {
+                "name": "spaces/AAQA1k9BNCE",
+                "displayName": "Daily Sync - Jun 11",
+                "spaceType": "SPACE",
+            },
+            {
+                "name": "spaces/OTHER",
+                "displayName": "Random Room",
+                "spaceType": "SPACE",
+            },
+        ]
+    }
+
+    matches = await _admin_search_spaces(
+        chat_service,
+        display_name_candidates=["Daily Sync Jun 11", "Daily Sync - Jun 11"],
+    )
+
+    assert len(matches) == 1
+    assert matches[0]["name"] == "spaces/AAQA1k9BNCE"
+    search_mock = chat_service.spaces().search
+    assert search_mock.call_count >= 1
+    call_kwargs = search_mock.call_args.kwargs
+    assert call_kwargs["useAdminAccess"] is True
+
+
+@pytest.mark.asyncio
+async def test_find_chat_space_uses_registry_before_list(monkeypatch, tmp_path):
+    registry = tmp_path / "chat-space-registry.json"
+    registry.write_text(
+        """
+        {
+          "by_name": {"daily sync jun 11": "spaces/AAQA1k9BNCE"},
+          "spaces": {},
+          "candidate_ids": ["AAQA1k9BNCE"]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WORKSPACE_MCP_CHAT_SPACE_REGISTRY", str(registry))
+
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/AAQA1k9BNCE",
+        "displayName": "Daily Sync - Jun 11",
+        "spaceType": "SPACE",
+        "lastActiveTime": "2026-06-05T23:44:53.761470Z",
+    }
+
+    from gchat.chat_tools import find_chat_space
+
+    result = await _unwrap(find_chat_space)(
+        chat_service=chat_service,
+        calendar_service=Mock(),
+        gmail_service=Mock(),
+        user_google_email="test@example.com",
+        name="Daily Sync Jun 11",
+    )
+
+    assert "AAQA1k9BNCE" in result
+    assert "Daily Sync - Jun 11" in result
+    chat_service.spaces().list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_space_parses_url_and_caches(monkeypatch, tmp_path):
+    registry = tmp_path / "chat-space-registry.json"
+    monkeypatch.setenv("WORKSPACE_MCP_CHAT_SPACE_REGISTRY", str(registry))
+
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/AAQA1k9BNCE",
+        "displayName": "Daily Sync - Jun 11",
+        "spaceType": "SPACE",
+        "spaceUri": "https://chat.google.com/room/AAQA1k9BNCE?cls=11",
+    }
+
+    from gchat.chat_tools import get_space
+
+    result = await _unwrap(get_space)(
+        service=chat_service,
+        user_google_email="test@example.com",
+        space_id_or_url="https://mail.google.com/mail/u/5/#chat/space/AAQA1k9BNCE",
+    )
+
+    assert "Daily Sync - Jun 11" in result
+    saved = json.loads(registry.read_text(encoding="utf-8"))
+    assert saved["by_name"]["daily sync jun 11"] == "spaces/AAQA1k9BNCE"

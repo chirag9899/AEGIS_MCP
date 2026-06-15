@@ -15,6 +15,10 @@
 #
 #  Or run locally:
 #    AEGIS_REGISTRATION_SECRET='...' bash install_device.sh
+#
+#  One command does everything: register device, write Claude config,
+#  Google sign-in (browser), save tokens. Then open Claude Desktop.
+#  Set AEGIS_SKIP_PREAUTH=1 to skip the browser sign-in step.
 # ============================================================
 set -euo pipefail
 
@@ -99,6 +103,24 @@ echo "╔═══════════════════════�
 echo "║     Aegis Google Workspace MCP — Setup       ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
+echo "  One command: register → Claude config → Google sign-in → done."
+echo "  Quit Claude Desktop first (Cmd+Q) so you are not asked to run"
+echo "  a second command afterward."
+echo ""
+
+if pgrep -f "mcp-remote.*aegis.infrasingularity.com" >/dev/null 2>&1 \
+    || pgrep -x "Claude" >/dev/null 2>&1 \
+    || pgrep -f "Claude Desktop" >/dev/null 2>&1; then
+    echo "  NOTE: Claude (or mcp-remote) is running now."
+    if [ -t 0 ]; then
+        echo "  Quit Claude completely, then press Enter to continue..."
+        read -r
+    else
+        echo "  Quit Claude, then re-run this script for a single-step setup."
+        echo "  Continuing anyway — you may need one extra command at the end."
+        echo ""
+    fi
+fi
 
 FINGERPRINT=$(generate_fingerprint)
 LABEL="${AEGIS_LABEL:-$(hostname)}"
@@ -164,10 +186,46 @@ fi
 
 # Strip any query params from the MCP URL (key is always passed as a header, not URL param)
 MCP_URL=$(echo "$MCP_URL_WITH_KEY" | python3 -c "import sys; url=sys.stdin.read().strip(); print(url.split('?')[0])")
+OAUTH_CLIENT_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); c=d.get('oauth_client') or {}; print(c.get('client_id',''))" 2>/dev/null || true)
+OAUTH_CLIENT_SECRET=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); c=d.get('oauth_client') or {}; print(c.get('client_secret',''))" 2>/dev/null || true)
 
 echo "  Device key  : $KEY"
+REUSED=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('reused') else 'no')" 2>/dev/null || echo "no")
+if [ "$REUSED" = "yes" ]; then
+    echo "  (same device key as before — existing ~/.mcp-auth tokens still apply if device key unchanged)"
+fi
 echo "  MCP URL     : $MCP_URL"
+if [ -n "$OAUTH_CLIENT_ID" ]; then
+    echo "  OAuth client: ${OAUTH_CLIENT_ID:0:8}... (stable per machine)"
+fi
 echo ""
+
+AEGIS_DIR="$HOME/.aegis"
+OAUTH_CLIENT_FILE="$AEGIS_DIR/mcp-oauth-client.json"
+mkdir -p "$AEGIS_DIR"
+if [ -n "$OAUTH_CLIENT_ID" ] && [ -n "$OAUTH_CLIENT_SECRET" ]; then
+    python3 -c "
+import json, sys
+path, client_id, client_secret = sys.argv[1], sys.argv[2], sys.argv[3]
+payload = {'client_id': client_id, 'client_secret': client_secret}
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(payload, f, indent=2)
+" "$OAUTH_CLIENT_FILE" "$OAUTH_CLIENT_ID" "$OAUTH_CLIENT_SECRET"
+    chmod 600 "$OAUTH_CLIENT_FILE" 2>/dev/null || true
+    echo "  OAuth client file: $OAUTH_CLIENT_FILE"
+    echo ""
+fi
+
+SERVER_NAME=$(echo "$SERVERS" | python3 -c "import sys,json; print(list(json.load(sys.stdin).keys())[0])")
+
+DEVICE_JSON="$AEGIS_DIR/device.json"
+python3 -c "
+import json, sys
+path, key, url, name, fp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump({'device_key': key, 'mcp_url': url, 'server_name': name, 'fingerprint': fp}, f, indent=2)
+" "$DEVICE_JSON" "$KEY" "$MCP_URL" "$SERVER_NAME" "$FINGERPRINT"
+chmod 600 "$DEVICE_JSON" 2>/dev/null || true
 
 # Write to claude_desktop_config.json (local file, NOT synced via Claude account)
 CLAUDE_CONFIG=$(detect_claude_config_path)
@@ -179,43 +237,86 @@ mkdir -p "$(dirname "$CLAUDE_CONFIG")"
 
 # Use mcp-remote with --header flag to pass device key securely
 # Key in args (not URL) avoids OAuth resource URL mismatch in mcp-remote validation
-SERVER_NAME=$(echo "$SERVERS" | python3 -c "import sys,json; print(list(json.load(sys.stdin).keys())[0])")
+
+OAUTH_FILE_FOR_CONFIG=""
+if [ -n "$OAUTH_CLIENT_ID" ] && [ -n "$OAUTH_CLIENT_SECRET" ] && [ -f "$OAUTH_CLIENT_FILE" ]; then
+    OAUTH_FILE_FOR_CONFIG="$OAUTH_CLIENT_FILE"
+fi
 
 if [ ! -f "$CLAUDE_CONFIG" ] || [ ! -s "$CLAUDE_CONFIG" ]; then
     python3 -c "
-import json, sys
-name, url, key = sys.argv[1], sys.argv[2], sys.argv[3]
-entry = {'command': 'npx', 'args': ['mcp-remote', url, '--header', 'X-Device-Key: ' + key]}
+import json, os, sys
+name, url, key, oauth_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+args = ['-y', 'mcp-remote@0.1.38', url, '--header', 'X-Device-Key: ' + key, '--transport', 'http-first']
+if oauth_file and os.path.isfile(oauth_file):
+    args.extend(['--static-oauth-client-info', '@' + oauth_file])
+entry = {'command': 'npx', 'args': args}
 print(json.dumps({'mcpServers': {name: entry}}, indent=2))
-" "$SERVER_NAME" "$MCP_URL" "$KEY" > "$CLAUDE_CONFIG"
+" "$SERVER_NAME" "$MCP_URL" "$KEY" "$OAUTH_FILE_FOR_CONFIG" > "$CLAUDE_CONFIG"
     echo "Created new config."
 else
     python3 -c "
-import sys, json
-config_path, name, url, key = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+import json, os, sys
+config_path, name, url, key, oauth_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 with open(config_path, 'r') as f:
     config = json.load(f)
-entry = {'command': 'npx', 'args': ['mcp-remote', url, '--header', 'X-Device-Key: ' + key]}
+args = ['-y', 'mcp-remote@0.1.38', url, '--header', 'X-Device-Key: ' + key, '--transport', 'http-first']
+if oauth_file and os.path.isfile(oauth_file):
+    args.extend(['--static-oauth-client-info', '@' + oauth_file])
+entry = {'command': 'npx', 'args': args}
 config.setdefault('mcpServers', {})[name] = entry
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
 print('Merged successfully.')
-" "$CLAUDE_CONFIG" "$SERVER_NAME" "$MCP_URL" "$KEY"
+" "$CLAUDE_CONFIG" "$SERVER_NAME" "$MCP_URL" "$KEY" "$OAUTH_FILE_FOR_CONFIG"
 fi
 
+echo "Step 1/2 complete — device registered and Claude config written."
+echo ""
+
+if [ -n "${AEGIS_SKIP_PREAUTH:-}" ]; then
+    echo "Skipping Google sign-in (AEGIS_SKIP_PREAUTH is set)."
+    echo "Run later: curl -fsSL $SERVER/mcp_preauth.sh | bash"
+    exit 0
+fi
+
+if pgrep -f "mcp-remote.*aegis.infrasingularity.com" >/dev/null 2>&1 \
+    || pgrep -x "Claude" >/dev/null 2>&1 \
+    || pgrep -f "Claude Desktop" >/dev/null 2>&1; then
+    echo "╔══════════════════════════════════════════════╗"
+    echo "║  Almost done — quit Claude Desktop first     ║"
+    echo "╚══════════════════════════════════════════════╝"
+    echo ""
+    echo "  Claude (or mcp-remote) is still running."
+    echo "  Quit Claude completely (Cmd+Q), then run ONE command:"
+    echo ""
+    echo "    curl -fsSL $SERVER/mcp_preauth.sh | bash"
+    echo ""
+    echo "  That finishes Google sign-in and saves tokens."
+    echo "  Then open Claude — it should connect without prompting again."
+    echo ""
+    exit 0
+fi
+
+TMPDIR="${TMPDIR:-/tmp}"
+PREAUTH_PY="$TMPDIR/aegis-mcp-preauth-$$.py"
+cleanup_preauth() { rm -f "$PREAUTH_PY"; }
+trap cleanup_preauth EXIT
+
+if ! curl -fsSL "$SERVER/mcp_preauth.py" -o "$PREAUTH_PY"; then
+    echo "WARNING: Could not download pre-auth helper. Run manually:"
+    echo "  curl -fsSL $SERVER/mcp_preauth.sh | bash"
+    exit 0
+fi
+
+python3 "$PREAUTH_PY" --server "$SERVER" --from-install
+
+echo ""
 echo "╔══════════════════════════════════════════════╗"
-echo "║  Setup complete!                             ║"
-echo "║                                              ║"
-echo "║  1. Quit and reopen Claude Desktop.          ║"
-echo "║  2. Sign in with your Google Workspace       ║"
-echo "║     account when prompted.                   ║"
-echo "║  3. Your email is verified automatically —   ║"
-echo "║     no manual input needed.                  ║"
-echo "║                                              ║"
-echo "║  DO NOT re-add via Connectors UI —           ║"
-echo "║  that would sync to all devices.             ║"
+echo "║  All done — open Claude Desktop              ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
-echo "  Device key : $KEY"
-echo "  MCP URL    : $MCP_URL"
+echo "  Do NOT add Aegis via Settings → Connectors."
+echo "  If Claude opens Google sign-in anyway, quit (Cmd+Q) and do NOT"
+echo "  sign in there — run: curl -fsSL $SERVER/mcp_preauth.sh | bash"
 echo ""

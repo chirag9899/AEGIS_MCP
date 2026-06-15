@@ -92,8 +92,40 @@ if "location = /install.sh" not in text:
         include /etc/nginx/snippets/proxy-mcp.conf;
     }
 
+    location = /mcp_preauth.sh {
+        proxy_pass http://127.0.0.1:8010/mcp_preauth.sh;
+        include /etc/nginx/snippets/proxy-mcp.conf;
+    }
+
+    location = /mcp_preauth.py {
+        proxy_pass http://127.0.0.1:8010/mcp_preauth.py;
+        include /etc/nginx/snippets/proxy-mcp.conf;
+    }
+
 """
     text = text.replace(end + "\n", end + "\n\n" + install_block, 1)
+
+if "location = /mcp_preauth.py" not in text:
+    text = text.replace(
+        """    location = /mcp_preauth.sh {
+        proxy_pass http://127.0.0.1:8010/mcp_preauth.sh;
+        include /etc/nginx/snippets/proxy-mcp.conf;
+    }
+
+""",
+        """    location = /mcp_preauth.sh {
+        proxy_pass http://127.0.0.1:8010/mcp_preauth.sh;
+        include /etc/nginx/snippets/proxy-mcp.conf;
+    }
+
+    location = /mcp_preauth.py {
+        proxy_pass http://127.0.0.1:8010/mcp_preauth.py;
+        include /etc/nginx/snippets/proxy-mcp.conf;
+    }
+
+""",
+        1,
+    )
 
 soros.write_text(text)
 print(f"Patched {soros}")

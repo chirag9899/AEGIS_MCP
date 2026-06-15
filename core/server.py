@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import List, Optional
 from importlib import metadata
 
@@ -91,10 +92,62 @@ def _compute_scope_fingerprint() -> str:
 
 
 # Custom FastMCP that adds secure middleware stack for OAuth 2.1
+async def _reregister_stable_oauth_clients() -> None:
+    """Re-register all stable OAuth clients on server startup.
+
+    Ensures clients survive server restarts even when the auth provider's
+    storage backend is in-memory. Without this, a restart between device
+    registration and the first OAuth flow causes invalid_client errors,
+    which corrupt mcp-remote's PKCE state and create an unrecoverable loop.
+    """
+    try:
+        from auth.mcp_oauth_client_registry import (
+            ensure_oauth_client_registered,
+            _oauth_clients_section,
+        )
+        from auth.device_key_registry import _read_registry
+
+        provider = get_auth_provider()
+        if provider is None:
+            return
+
+        data = _read_registry()
+        clients = _oauth_clients_section(data)
+        count = 0
+        for entry in clients.values():
+            if not isinstance(entry, dict):
+                continue
+            client_id = entry.get("client_id")
+            client_secret = entry.get("client_secret")
+            if client_id and client_secret:
+                await ensure_oauth_client_registered(
+                    provider,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                )
+                count += 1
+        if count:
+            logger.info("Re-registered %d stable OAuth client(s) on startup", count)
+    except Exception as exc:
+        logger.warning("Stable OAuth client re-registration on startup failed: %s", exc)
+
+
 class SecureFastMCP(FastMCP):
     def http_app(self, **kwargs) -> "Starlette":
         """Override to add secure middleware stack for OAuth 2.1."""
         app = super().http_app(**kwargs)
+
+        # Re-register stable OAuth clients so they survive server restarts.
+        # Starlette 1.0 removed router.on_startup — wrap the existing lifespan instead.
+        _existing_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def _lifespan_with_reregister(app):
+            await _reregister_stable_oauth_clients()
+            async with _existing_lifespan(app) as state:
+                yield state
+
+        app.router.lifespan_context = _lifespan_with_reregister
 
         # Add middleware in order (first added = outermost layer)
         # 0: ResourceAliasMiddleware   – rewrites WWW-Authenticate/Location headers per-alias
@@ -810,6 +863,34 @@ async def device_register(request: Request):
 
     entry = register_pending_device(fingerprint, label)
     key = entry["key"]
+    reused = bool(entry.get("reused"))
+
+    oauth_client = None
+    try:
+        from auth.mcp_oauth_client_registry import (
+            ensure_oauth_client_registered,
+            get_or_create_stable_oauth_client,
+        )
+
+        oauth_client = get_or_create_stable_oauth_client(
+            fingerprint, label=label
+        )
+    except Exception as exc:
+        logger.warning("Stable OAuth client creation failed (non-fatal): %s", exc)
+        oauth_client = None
+    else:
+        try:
+            provider = get_auth_provider()
+            await ensure_oauth_client_registered(
+                provider,
+                client_id=oauth_client["client_id"],
+                client_secret=oauth_client["client_secret"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Stable OAuth client provider registration failed (non-fatal): %s",
+                exc,
+            )
 
     claude_config = {
         "mcpServers": {
@@ -817,10 +898,11 @@ async def device_register(request: Request):
         }
     }
 
-    return JSONResponse({
+    payload = {
         "key": key,
         "mcp_url": _MCP_PUBLIC_URL,
         "label": label,
+        "reused": reused,
         "claude_desktop_config": claude_config,
         "instructions": (
             "Add the 'mcpServers' block from claude_desktop_config to:\n"
@@ -829,7 +911,10 @@ async def device_register(request: Request):
             "  Linux:   ~/.config/claude/claude_desktop_config.json\n"
             "\nYour email will be auto-detected when you sign in with Google."
         ),
-    })
+    }
+    if oauth_client:
+        payload["oauth_client"] = oauth_client
+    return JSONResponse(payload)
 
 
 @server.custom_route("/device/list", methods=["GET"])
@@ -851,5 +936,31 @@ async def serve_install_script(request: Request):
         content = script_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return Response("# install script not found", status_code=404, media_type="text/plain")
+    from starlette.responses import Response as _Resp
+    return _Resp(content=content, media_type="text/plain; charset=utf-8")
+
+
+@server.custom_route("/mcp_preauth.sh", methods=["GET"])
+async def serve_mcp_preauth_script(request: Request):
+    """Serve one-shot mcp-remote OAuth helper (run with Claude Desktop quit)."""
+    import pathlib
+    script_path = pathlib.Path(__file__).parent.parent / "scripts" / "mcp_preauth.sh"
+    try:
+        content = script_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Response("# mcp_preauth script not found", status_code=404, media_type="text/plain")
+    from starlette.responses import Response as _Resp
+    return _Resp(content=content, media_type="text/plain; charset=utf-8")
+
+
+@server.custom_route("/mcp_preauth.py", methods=["GET"])
+async def serve_mcp_preauth_python(request: Request):
+    """Serve Python OAuth helper used by mcp_preauth.sh."""
+    import pathlib
+    script_path = pathlib.Path(__file__).parent.parent / "scripts" / "mcp_preauth.py"
+    try:
+        content = script_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Response("# mcp_preauth.py not found", status_code=404, media_type="text/plain")
     from starlette.responses import Response as _Resp
     return _Resp(content=content, media_type="text/plain; charset=utf-8")

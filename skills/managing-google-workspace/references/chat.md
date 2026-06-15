@@ -15,6 +15,24 @@ Lists Google Chat spaces (rooms and direct messages) accessible to the user.
 | page_size | integer | no | 100 | |
 | space_type | string | no | "all" | |
 
+### find_chat_space
+**Preferred** for Meet-linked rooms like `Daily Sync – Jun 11`. Searches a shared org registry, Workspace-admin `spaces.search` (when `chat.admin.spaces.readonly` is granted), `spaces.list`, Calendar, Gmail, and direct `spaces.get` probes. Meet rooms with no messages are often missing from `list_spaces` but still retrievable by ID. Workspace admins must reconnect OAuth after the admin scope is added.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| name | string | yes | | e.g. `Daily Sync Jun 11` |
+| event_date | string | no | | ISO date `2026-06-11` if not in name |
+| chat_url | string | no | | Gmail/Chat URL; cached for the team |
+
+### get_space
+Look up a space by ID or Chat URL. Caches successful lookups for `find_chat_space`.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| space_id_or_url | string | yes | | `spaces/AAQA...`, bare ID, or Chat URL |
+
 ---
 
 ## Messages
@@ -76,7 +94,7 @@ Downloads an attachment from a Chat message. Returns a local file path (stdio mo
 
 ## Tips
 
-**Space IDs**: Call `list_spaces` first to discover available spaces and their IDs. You need the space ID for all message operations.
+**Space IDs**: For named Meet rooms (e.g. Daily Sync by date), use `find_chat_space` first—not `list_spaces` or `search_messages`. If you have a Chat URL, use `get_space` or pass `chat_url` to `find_chat_space`; the ID is cached for the team. Use `get_messages` with the returned space ID even when the room has zero messages.
 
 **Message resource names**: Messages are identified by their full resource name in the format `spaces/SPACE_ID/messages/MESSAGE_ID`. This is the value expected by `create_reaction` and `download_chat_attachment`.
 

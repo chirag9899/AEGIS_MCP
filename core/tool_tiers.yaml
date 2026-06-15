@@ -102,6 +102,8 @@ chat:
     - create_reaction
   extended:
     - list_spaces
+    - find_chat_space
+    - get_space
     - download_chat_attachment
   complete: []
 

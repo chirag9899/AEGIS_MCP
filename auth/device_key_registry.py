@@ -90,12 +90,61 @@ def is_device_key_enforcement_enabled() -> bool:
 
 # ── Registration ─────────────────────────────────────────────────────────────
 
+def find_existing_device_for_fingerprint(fingerprint: str) -> dict | None:
+    """Return the newest bound or pending device entry for this fingerprint, if any."""
+    if not fingerprint:
+        return None
+    data = _read_registry()
+    now = int(time.time())
+
+    best_bound: dict | None = None
+    best_bound_ts = -1
+    for email, devices in data.items():
+        if email.startswith("_") or not isinstance(devices, list):
+            continue
+        for entry in devices:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("fingerprint") != fingerprint or not entry.get("key"):
+                continue
+            ts = int(entry.get("bound_at") or entry.get("registered_at") or 0)
+            if ts >= best_bound_ts:
+                best_bound = entry
+                best_bound_ts = ts
+    if best_bound is not None:
+        return best_bound
+
+    best_pending: dict | None = None
+    best_pending_ts = -1
+    for entry in data.get("_pending", []):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("fingerprint") != fingerprint or not entry.get("key"):
+            continue
+        if entry.get("expires_at", 0) <= now:
+            continue
+        ts = int(entry.get("registered_at") or 0)
+        if ts >= best_pending_ts:
+            best_pending = entry
+            best_pending_ts = ts
+    return best_pending
+
+
 def register_pending_device(fingerprint: str, label: str) -> dict:
     """
     Register a new device without requiring an email address.
     The key is stored as "pending" — it will be bound to an email on first OAuth login.
     Pending keys expire after 7 days if never claimed.
     """
+    existing = find_existing_device_for_fingerprint(fingerprint)
+    if existing and existing.get("key"):
+        logger.info(
+            "Reusing device key for fingerprint %s...: key=%s...",
+            fingerprint[:12],
+            existing["key"][:8],
+        )
+        return {**existing, "reused": True}
+
     key = secrets.token_urlsafe(24)
     entry = {
         "key": key,

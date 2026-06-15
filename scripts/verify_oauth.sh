@@ -58,7 +58,10 @@ check_json_field "resource URL" "$BASE/.well-known/oauth-protected-resource/goog
 check_json_field "auth server list" "$BASE/.well-known/oauth-protected-resource/google/mcp" \
     "import sys,json; d=json.load(sys.stdin); assert '$BASE/google' in d.get('authorization_servers',[])"
 check "RFC8414 auth server metadata" "$BASE/.well-known/oauth-authorization-server/google" "200"
+check "domain-root auth server metadata (mcp-remote)" "$BASE/.well-known/oauth-authorization-server" "200"
 check "issuer-path auth server (via /google/)" "$BASE/google/.well-known/oauth-authorization-server" "200"
+check "pre-auth helper script" "$BASE/mcp_preauth.sh" "200"
+check "pre-auth python helper" "$BASE/mcp_preauth.py" "200"
 check "MCP endpoint (unauth)" "$BASE/google/mcp" "401"
 check "legacy google-mcp alias" "$BASE/google-mcp/.well-known/oauth-authorization-server" "200"
 check "install script" "$BASE/install.sh" "200"

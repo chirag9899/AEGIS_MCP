@@ -7,8 +7,10 @@ This module provides MCP tools for interacting with Google Chat API.
 import base64
 import logging
 import asyncio
+import re
 import ssl
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set
 
 import httpx
 from googleapiclient.errors import HttpError
@@ -19,6 +21,20 @@ from mcp.types import ToolAnnotations
 from auth.service_decorator import require_google_service, require_multiple_services
 from core.server import server
 from core.utils import TransientNetworkError, handle_http_errors
+from gchat.space_discovery import (
+    add_candidate_ids,
+    build_display_name_candidates,
+    extract_space_id_from_url,
+    extract_space_ids_from_text,
+    filter_spaces_by_display_name,
+    format_space_line,
+    lookup_registry_by_event,
+    lookup_registry_by_name,
+    names_match_candidates,
+    normalize_space_resource_name,
+    parse_date_from_text,
+    register_space,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +44,11 @@ _sender_name_cache: Dict[str, str] = {}
 _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES = 1
 _SEARCH_MESSAGES_SSL_RETRIES = 3
 _SEARCH_MESSAGES_RETRY_BASE_DELAY_SECONDS = 1
+_LIST_SPACES_API_PAGE_SIZE = 1000
+_LIST_SPACES_MAX_PAGES = 20
+_FIND_CHAT_SPACE_PROBE_LIMIT = 40
+_ADMIN_SEARCH_PAGE_SIZE = 25
+_ADMIN_SEARCH_MAX_PAGES = 4
 
 
 def _cache_sender(user_id: str, name: str) -> None:
@@ -135,6 +156,234 @@ def _extract_rich_links(msg: dict) -> List[str]:
     return urls
 
 
+async def _fetch_all_spaces(service, *, filter_param: Optional[str] = None) -> List[dict]:
+    spaces: List[dict] = []
+    page_token: Optional[str] = None
+    for _ in range(_LIST_SPACES_MAX_PAGES):
+        request_params: Dict[str, object] = {"pageSize": _LIST_SPACES_API_PAGE_SIZE}
+        if filter_param:
+            request_params["filter"] = filter_param
+        if page_token:
+            request_params["pageToken"] = page_token
+        response = await asyncio.to_thread(
+            service.spaces().list(**request_params).execute
+        )
+        spaces.extend(response.get("spaces", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return spaces
+
+
+async def _get_space_dict(service, space_id: str) -> dict:
+    resource = normalize_space_resource_name(space_id)
+    return await asyncio.to_thread(service.spaces().get(name=resource).execute)
+
+
+def _build_admin_search_query(display_name_candidates: List[str]) -> Optional[str]:
+    """Build a Workspace-admin spaces.search query from display-name candidates."""
+    phrases: List[str] = []
+    seen: Set[str] = set()
+    for candidate in sorted(display_name_candidates, key=len, reverse=True):
+        phrase = " ".join(candidate.split())
+        if len(phrase) < 3 or phrase.lower() in seen:
+            continue
+        seen.add(phrase.lower())
+        phrases.append(phrase)
+        if len(phrases) >= 3:
+            break
+    if not phrases:
+        return None
+    display_clause = " OR ".join(f'displayName:"{phrase}"' for phrase in phrases)
+    if len(phrases) > 1:
+        display_clause = f"({display_clause})"
+    return (
+        'customer = "customers/my_customer" AND spaceType = "SPACE" AND '
+        f"{display_clause}"
+    )
+
+
+async def _admin_search_spaces(
+    chat_service,
+    *,
+    display_name_candidates: List[str],
+) -> List[dict]:
+    """Search all org spaces via admin API (finds inactive Meet rooms)."""
+    query = _build_admin_search_query(display_name_candidates)
+    if not query:
+        return []
+
+    matches: List[dict] = []
+    page_token: Optional[str] = None
+    for _ in range(_ADMIN_SEARCH_MAX_PAGES):
+        request_params = {
+            "query": query,
+            "useAdminAccess": True,
+            "pageSize": _ADMIN_SEARCH_PAGE_SIZE,
+        }
+        if page_token:
+            request_params["pageToken"] = page_token
+        try:
+            response = await asyncio.to_thread(
+                chat_service.spaces().search(**request_params).execute
+            )
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+            if status in (403, 401):
+                logger.info(
+                    "[find_chat_space] Admin spaces.search unavailable (HTTP %s): %s",
+                    status,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "[find_chat_space] Admin spaces.search failed: %s", exc
+                )
+            return []
+        except Exception as exc:
+            logger.warning("[find_chat_space] Admin spaces.search failed: %s", exc)
+            return []
+
+        for space in response.get("spaces", []):
+            display_name = space.get("displayName", "")
+            if names_match_candidates(display_name, display_name_candidates):
+                matches.append(space)
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return _dedupe_spaces(matches)
+
+
+async def _find_calendar_event(
+    calendar_service,
+    *,
+    query: str,
+    event_date: Optional[str],
+) -> Optional[dict]:
+    if not event_date:
+        return None
+    try:
+        start = datetime.strptime(event_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    end = start + timedelta(days=1)
+    request_params = {
+        "calendarId": "primary",
+        "timeMin": start.isoformat().replace("+00:00", "Z"),
+        "timeMax": end.isoformat().replace("+00:00", "Z"),
+        "singleEvents": True,
+        "maxResults": 10,
+    }
+    if query:
+        request_params["q"] = query
+    response = await asyncio.to_thread(
+        calendar_service.events().list(**request_params).execute
+    )
+    items = response.get("items", [])
+    return items[0] if items else None
+
+
+def _meet_code_from_event(event: dict) -> Optional[str]:
+    hangout = event.get("hangoutLink") or ""
+    match = re.search(r"meet\.google\.com/([a-z]+-[a-z]+-[a-z]+)", hangout, re.I)
+    if match:
+        return match.group(1).lower()
+    for entry in event.get("conferenceData", {}).get("entryPoints", []):
+        uri = entry.get("uri", "")
+        match = re.search(r"meet\.google\.com/([a-z]+-[a-z]+-[a-z]+)", uri, re.I)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+async def _harvest_gmail_space_ids(gmail_service, *, query: str) -> Set[str]:
+    discovered: Set[str] = set()
+    try:
+        response = await asyncio.to_thread(
+            gmail_service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=15)
+            .execute
+        )
+        for item in response.get("messages", []):
+            message = await asyncio.to_thread(
+                gmail_service.users()
+                .messages()
+                .get(userId="me", id=item["id"], format="raw")
+                .execute
+            )
+            raw = base64.urlsafe_b64decode(message.get("raw", ""))
+            discovered.update(
+                extract_space_ids_from_text(raw.decode("utf-8", errors="replace"))
+            )
+    except Exception as exc:
+        logger.debug("[find_chat_space] Gmail harvest skipped: %s", exc)
+    return discovered
+
+
+def _dedupe_spaces(spaces: List[dict]) -> List[dict]:
+    deduped: List[dict] = []
+    seen: Set[str] = set()
+    for space in spaces:
+        resource = space.get("name", "")
+        if not resource or resource in seen:
+            continue
+        seen.add(resource)
+        deduped.append(space)
+    return deduped
+
+
+def _format_find_chat_space_success(
+    name: str,
+    spaces: List[dict],
+    sources: str,
+    *,
+    calendar_event: Optional[dict] = None,
+) -> str:
+    for space in spaces:
+        register_space(
+            space_id=space.get("name", ""),
+            display_name=space.get("displayName", ""),
+            meet_code=_meet_code_from_event(calendar_event) if calendar_event else None,
+            event_instance_id=calendar_event.get("id") if calendar_event else None,
+        )
+    lines = [f"Found {len(spaces)} matching space(s) for '{name}' (via {sources}):"]
+    lines.extend(format_space_line(space) for space in spaces)
+    lines.append(
+        "\nUse get_messages with the space ID above. "
+        "Meet-linked rooms may have zero messages until chat activity occurs."
+    )
+    return "\n".join(lines)
+
+
+async def _probe_spaces_for_names(
+    chat_service,
+    *,
+    candidate_ids: List[str],
+    display_name_candidates: List[str],
+) -> List[dict]:
+    matches: List[dict] = []
+    seen: Set[str] = set()
+    for bare_id in candidate_ids[:_FIND_CHAT_SPACE_PROBE_LIMIT]:
+        resource = normalize_space_resource_name(bare_id)
+        if resource in seen:
+            continue
+        seen.add(resource)
+        try:
+            space = await _get_space_dict(chat_service, resource)
+        except Exception:
+            continue
+        display_name = space.get("displayName", "")
+        if names_match_candidates(display_name, display_name_candidates):
+            matches.append(space)
+            register_space(
+                space_id=resource,
+                display_name=display_name,
+            )
+    return matches
+
+
 @server.tool(
     title="List Spaces",
     annotations=ToolAnnotations(
@@ -185,6 +434,234 @@ async def list_spaces(
         output.append(f"- {space_name} (ID: {space_id}, Type: {space_type_actual})")
 
     return "\n".join(output)
+
+
+@server.tool(
+    title="Get Chat Space",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_spaces_readonly")
+@handle_http_errors("get_space", service_type="chat")
+async def get_space(
+    service,
+    user_google_email: str,
+    space_id_or_url: str,
+) -> str:
+    """
+    Returns metadata for a Google Chat space by ID or Chat URL.
+
+    Accepts a resource name (`spaces/AAQA1k9BNCE`), bare ID (`AAQA1k9BNCE`),
+    or a Gmail/Chat URL containing `#chat/space/...` or `chat.google.com/room/...`.
+    Successful lookups are cached for future `find_chat_space` calls.
+    """
+    extracted = extract_space_id_from_url(space_id_or_url)
+    if not extracted:
+        return (
+            "Could not parse a Chat space ID from the input. Provide `spaces/...`, "
+            "a bare space ID, or a Chat URL such as "
+            "`https://mail.google.com/mail/u/0/#chat/space/AAQA1k9BNCE`."
+        )
+
+    resource = normalize_space_resource_name(extracted)
+    logger.info("[get_space] Email=%s, Space=%s", user_google_email, resource)
+
+    space = await _get_space_dict(service, resource)
+    display_name = space.get("displayName", "Unnamed Space")
+    register_space(space_id=resource, display_name=display_name)
+    add_candidate_ids({resource})
+
+    lines = [
+        f"Space: {display_name}",
+        f"ID: {space.get('name', resource)}",
+        f"Type: {space.get('spaceType', 'UNKNOWN')}",
+        f"Last active: {space.get('lastActiveTime') or 'unknown'}",
+        f"Created: {space.get('createTime') or 'unknown'}",
+    ]
+    space_uri = space.get("spaceUri") or ""
+    if space_uri:
+        lines.append(f"URI: {space_uri}")
+    lines.append(
+        "Cached for future lookups via find_chat_space. "
+        "Use get_messages with this ID even if the space has no messages yet."
+    )
+    return "\n".join(lines)
+
+
+@server.tool(
+    title="Find Chat Space",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_multiple_services(
+    [
+        {"service_type": "chat", "scopes": "chat_spaces_readonly", "param_name": "chat_service"},
+        {"service_type": "calendar", "scopes": "calendar_read", "param_name": "calendar_service"},
+        {"service_type": "gmail", "scopes": "gmail_read", "param_name": "gmail_service"},
+    ]
+)
+@handle_http_errors("find_chat_space", service_type="chat")
+async def find_chat_space(
+    chat_service,
+    calendar_service,
+    gmail_service,
+    user_google_email: str,
+    name: str,
+    event_date: Optional[str] = None,
+    chat_url: Optional[str] = None,
+) -> str:
+    """
+    Find a Google Chat space by display name (e.g. "Daily Sync – Jun 11").
+
+    Uses multiple strategies because Meet-linked spaces with no chat messages are
+    often missing from spaces.list but are still accessible by ID:
+    1. Shared org registry (populated by prior get_space / find calls)
+    2. Workspace-admin spaces.search (requires chat.admin.spaces.readonly)
+    3. Full spaces.list pagination + name filter
+    4. Calendar event lookup for the matching date
+    5. Gmail scan + direct spaces.get probes on known candidate IDs
+
+    Args:
+        name: Space title or phrase, e.g. "Daily Sync Jun 11".
+        event_date: Optional ISO date (`2026-06-11`) when not present in name.
+        chat_url: Optional Chat/Gmail URL to register and return immediately.
+
+    Returns:
+        str: Matching space(s) with IDs, or calendar context when only Meet is known.
+    """
+    logger.info(
+        "[find_chat_space] Email=%s, Name=%s, Date=%s, URL=%s",
+        user_google_email,
+        name,
+        event_date,
+        bool(chat_url),
+    )
+
+    if chat_url:
+        extracted = extract_space_id_from_url(chat_url)
+        if extracted:
+            space = await _get_space_dict(chat_service, extracted)
+            register_space(
+                space_id=space.get("name", normalize_space_resource_name(extracted)),
+                display_name=space.get("displayName", name),
+            )
+            return (
+                f"Found space from URL:\n"
+                f"{format_space_line(space)}\n\n"
+                "Cached for future name-based lookups."
+            )
+
+    parsed_date = event_date or parse_date_from_text(name)
+    display_name_candidates = build_display_name_candidates(name, parsed_date)
+    matches: List[dict] = []
+    match_sources: List[str] = []
+
+    for candidate in display_name_candidates:
+        resource = lookup_registry_by_name(candidate)
+        if not resource:
+            continue
+        try:
+            space = await _get_space_dict(chat_service, resource)
+            matches.append(space)
+            match_sources.append("registry")
+        except Exception:
+            continue
+
+    if not matches:
+        admin_matches = await _admin_search_spaces(
+            chat_service,
+            display_name_candidates=display_name_candidates,
+        )
+        if admin_matches:
+            matches.extend(admin_matches)
+            match_sources.append("admin search")
+
+    if not matches:
+        listed = await _fetch_all_spaces(chat_service)
+        add_candidate_ids({space.get("name", "") for space in listed})
+        for candidate in display_name_candidates:
+            matches.extend(filter_spaces_by_display_name(listed, candidate))
+        if matches:
+            match_sources.append("spaces.list")
+
+    if deduped := _dedupe_spaces(matches):
+        sources = ", ".join(sorted(set(match_sources))) or "lookup"
+        return _format_find_chat_space_success(name, deduped, sources)
+
+    calendar_event = await _find_calendar_event(
+        calendar_service,
+        query=name.split("-")[0].strip() or "Daily Sync",
+        event_date=parsed_date,
+    )
+    if calendar_event and not matches:
+        resource = lookup_registry_by_event(calendar_event.get("id", ""))
+        if resource:
+            try:
+                matches.append(await _get_space_dict(chat_service, resource))
+                match_sources.append("registry+calendar")
+            except Exception:
+                pass
+
+    if not matches:
+        candidate_ids: List[str] = []
+        gmail_query = name
+        if parsed_date:
+            gmail_query = f'{name} after:{parsed_date.replace("-", "/")}'
+        candidate_ids.extend(
+            sorted(await _harvest_gmail_space_ids(gmail_service, query=gmail_query))
+        )
+        from gchat.space_discovery import load_registry
+
+        candidate_ids.extend(load_registry().get("candidate_ids", []))
+        probed = await _probe_spaces_for_names(
+            chat_service,
+            candidate_ids=candidate_ids,
+            display_name_candidates=display_name_candidates,
+        )
+        if probed:
+            matches.extend(probed)
+            match_sources.append("direct lookup")
+
+    deduped = _dedupe_spaces(matches)
+    if deduped:
+        sources = ", ".join(sorted(set(match_sources))) or "lookup"
+        return _format_find_chat_space_success(
+            name,
+            deduped,
+            sources,
+            calendar_event=calendar_event,
+        )
+
+    lines = [f"No Chat space found for '{name}'."]
+    if calendar_event:
+        meet_code = _meet_code_from_event(calendar_event)
+        lines.append("\nMatching calendar event:")
+        lines.append(f"- Title: {calendar_event.get('summary', 'Untitled')}")
+        lines.append(f"- Start: {calendar_event.get('start', {})}")
+        if calendar_event.get("hangoutLink"):
+            lines.append(f"- Meet link: {calendar_event['hangoutLink']}")
+        if meet_code:
+            lines.append(f"- Meet code: {meet_code}")
+        lines.append(
+            "\nThe Meet event exists, but Google does not expose the Chat space ID "
+            "in Calendar. Open the meeting chat once and call get_space with the "
+            "Chat URL, or pass chat_url to find_chat_space. The ID is then cached "
+            "for the whole team."
+        )
+    else:
+        lines.append(
+            "\nTried spaces.list, the shared registry, Gmail, and direct space lookup. "
+            "If you have the Chat URL, pass it as chat_url or use get_space."
+        )
+    return "\n".join(lines)
 
 
 @server.tool(
