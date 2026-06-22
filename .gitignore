@@ -12,6 +12,12 @@ claude.md
 build/
 dist/
 
+# ---- Node / npm vendoring (mcp-remote is fetched via npx, not vendored) -
+node_modules/
+mcp-remote-*.tgz
+*.tgz
+/package/
+
 # ---- Environments & tooling -------------------------------------------
 .env
 .venv/

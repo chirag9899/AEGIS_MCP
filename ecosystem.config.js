@@ -1,8 +1,8 @@
-/** PM2 process definitions for Aegis Google MCP. */
+/** PM2 process definitions for Local Google MCP. */
 module.exports = {
   apps: [
     {
-      name: "aegis-google-mcp",
+      name: "local-google-mcp",
       script: "scripts/start.sh",
       interpreter: "bash",
       cwd: __dirname,
