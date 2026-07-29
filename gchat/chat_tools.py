@@ -384,6 +384,99 @@ async def _probe_spaces_for_names(
     return matches
 
 
+async def _list_spaces_admin(
+    service,
+    *,
+    page_size: int,
+    space_filter: Optional[str],
+    order_by: Optional[str],
+) -> Optional[str]:
+    """Enumerate org spaces via the Workspace-admin spaces.search endpoint.
+
+    Unlike spaces.list (which only returns the caller's own, message-bearing
+    spaces), this surfaces message-less Meet-linked spaces across the org. Requires
+    the caller to be a Workspace admin with the Chat admin privilege plus the
+    chat.admin.spaces.readonly scope.
+
+    Returns a formatted string, or None when admin access is unavailable (401/403)
+    so the caller can fall back to a normal listing.
+    """
+    query_parts = ['customer = "customers/my_customer"', 'spaceType = "SPACE"']
+    if space_filter:
+        query_parts.append(f"({space_filter})")
+    query = " AND ".join(query_parts)
+
+    spaces: List[dict] = []
+    page_token: Optional[str] = None
+    drop_order = False
+    pages = 0
+    while pages < _ADMIN_SEARCH_MAX_PAGES and len(spaces) < page_size:
+        pages += 1
+        params = {
+            "query": query,
+            "useAdminAccess": True,
+            "pageSize": min(page_size, _ADMIN_SEARCH_PAGE_SIZE),
+        }
+        if order_by and not drop_order:
+            params["orderBy"] = order_by
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            response = await asyncio.to_thread(
+                service.spaces().search(**params).execute
+            )
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+            if status in (401, 403):
+                logger.info(
+                    "[list_spaces] admin spaces.search unavailable (HTTP %s)", status
+                )
+                return None
+            # orderBy field the API doesn't accept → retry once without it and
+            # rely on the client-side sort below.
+            if status == 400 and order_by and not drop_order:
+                logger.info(
+                    "[list_spaces] admin spaces.search rejected orderBy=%r; "
+                    "retrying without it",
+                    order_by,
+                )
+                drop_order = True
+                page_token = None
+                spaces = []
+                continue
+            raise
+        spaces.extend(response.get("spaces", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    # Client-side sort guarantees recency ordering even if the API ignored orderBy.
+    if order_by:
+        field = order_by.split()[0]
+        descending = "desc" in order_by.lower()
+        if field in ("createTime", "lastActiveTime"):
+            spaces.sort(key=lambda s: s.get(field, ""), reverse=descending)
+
+    spaces = spaces[:page_size]
+    if not spaces:
+        note = f" matching {space_filter}" if space_filter else ""
+        return f"No org spaces found via admin access{note}."
+
+    header = f"Found {len(spaces)} org space(s) via admin access"
+    if space_filter:
+        header += f" matching {space_filter}"
+    if order_by:
+        header += f", ordered by {order_by}"
+    output = [header + ":"]
+    for space in spaces:
+        created = f", created: {space['createTime']}" if space.get("createTime") else ""
+        output.append(
+            f"- {space.get('displayName', 'Unnamed Space')} "
+            f"(ID: {space.get('name', '')}, Type: {space.get('spaceType', 'UNKNOWN')}{created})"
+        )
+    return "\n".join(output)
+
+
 @server.tool(
     title="List Spaces",
     annotations=ToolAnnotations(
@@ -400,14 +493,51 @@ async def list_spaces(
     user_google_email: str,
     page_size: int = 100,
     space_type: str = "all",  # "all", "room", "dm"
+    use_admin_access: bool = False,
+    space_filter: Optional[str] = None,
+    order_by: Optional[str] = None,
 ) -> str:
     """
     Lists Google Chat spaces (rooms and direct messages) accessible to the user.
 
+    Args:
+        page_size: Maximum number of spaces to return (default 100).
+        space_type: "all", "room" (SPACE), or "dm" (DIRECT_MESSAGE). Ignored when
+                    use_admin_access is True (admin search covers named SPACES only).
+        use_admin_access: When True, enumerate ALL org spaces via the Workspace-admin
+                    spaces.search endpoint — this surfaces message-less Meet-linked
+                    spaces that a normal listing omits. Requires Workspace-admin
+                    privileges + chat.admin.spaces.readonly; falls back to the normal
+                    listing if unavailable.
+        space_filter: Admin-mode only. A Chat search clause AND-ed into the query,
+                    e.g. 'displayName:"Daily Sync"' (prefix match on the display name).
+        order_by: Admin-mode only. e.g. "createTime DESC" or "lastActiveTime DESC" to
+                    get the newest space first (useful for "latest X" queries).
+
     Returns:
-        str: A formatted list of Google Chat spaces accessible to the user.
+        str: A formatted list of Google Chat spaces.
     """
-    logger.info(f"[list_spaces] Email={user_google_email}, Type={space_type}")
+    logger.info(
+        f"[list_spaces] Email={user_google_email}, Type={space_type}, "
+        f"admin={use_admin_access}, filter={space_filter!r}, order_by={order_by!r}"
+    )
+
+    fallback_note = ""
+    if use_admin_access:
+        admin_result = await _list_spaces_admin(
+            service,
+            page_size=page_size,
+            space_filter=space_filter,
+            order_by=order_by,
+        )
+        if admin_result is not None:
+            return admin_result
+        # Admin access unavailable — fall through to the caller's own spaces.
+        fallback_note = (
+            "(Admin access unavailable — you may not be a Workspace admin or lack the "
+            "Chat admin privilege. Showing only your own spaces, which excludes "
+            "message-less Meet spaces.)\n"
+        )
 
     # Build filter based on space_type
     filter_param = None
@@ -424,9 +554,9 @@ async def list_spaces(
 
     spaces = response.get("spaces", [])
     if not spaces:
-        return f"No Chat spaces found for type '{space_type}'."
+        return f"{fallback_note}No Chat spaces found for type '{space_type}'."
 
-    output = [f"Found {len(spaces)} Chat spaces (type: {space_type}):"]
+    output = [f"{fallback_note}Found {len(spaces)} Chat spaces (type: {space_type}):"]
     for space in spaces:
         space_name = space.get("displayName", "Unnamed Space")
         space_id = space.get("name", "")
@@ -1217,3 +1347,639 @@ async def download_chat_attachment(
         f"[download_chat_attachment] Saved {size_kb:.1f} KB attachment to {result.path}"
     )
     return "\n".join(result_lines)
+
+
+# ---------------------------------------------------------------------------
+# Messages: get / update / delete
+# ---------------------------------------------------------------------------
+
+
+@server.tool(
+    title="Get Message",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_read")
+@handle_http_errors("get_message", is_read_only=True, service_type="chat")
+async def get_message(
+    service,
+    user_google_email: str,
+    message_id: str,
+) -> str:
+    """
+    Retrieves a single Google Chat message by its resource name.
+
+    Args:
+        message_id: The message resource name (e.g. spaces/X/messages/Y).
+
+    Returns:
+        str: Formatted message details.
+    """
+    logger.info(f"[get_message] Message: '{message_id}' for user '{user_google_email}'")
+
+    msg = await asyncio.to_thread(
+        service.spaces().messages().get(name=message_id).execute
+    )
+
+    sender = msg.get("sender", {})
+    sender_name = sender.get("displayName") or sender.get("name", "Unknown")
+    create_time = msg.get("createTime", "Unknown Time")
+    text_content = msg.get("text", "No text content")
+    thread = msg.get("thread", {})
+
+    output = [
+        f"Message {msg.get('name', message_id)}:",
+        f"  Sender: {sender_name}",
+        f"  Time: {create_time}",
+        f"  Text: {text_content}",
+    ]
+    if thread.get("name"):
+        output.append(f"  Thread: {thread['name']}")
+    attachments = msg.get("attachment", [])
+    for idx, att in enumerate(attachments):
+        output.append(
+            f"  [attachment {idx}: {att.get('contentName', 'unnamed')} "
+            f"({att.get('contentType', 'unknown')})]"
+        )
+    return "\n".join(output)
+
+
+@server.tool(
+    title="Update Message",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_write")
+@handle_http_errors("update_message", service_type="chat")
+async def update_message(
+    service,
+    user_google_email: str,
+    message_id: str,
+    new_text: str,
+) -> str:
+    """
+    Edits the text of an existing Google Chat message (must be sent by this app/user).
+
+    Args:
+        message_id: The message resource name (e.g. spaces/X/messages/Y).
+        new_text: The replacement text for the message.
+
+    Returns:
+        str: Confirmation message.
+    """
+    logger.info(f"[update_message] Message: '{message_id}'")
+
+    updated = await asyncio.to_thread(
+        service.spaces()
+        .messages()
+        .patch(name=message_id, updateMask="text", body={"text": new_text})
+        .execute
+    )
+    return (
+        f"Updated message {updated.get('name', message_id)}. "
+        f"Last update: {updated.get('lastUpdateTime', 'unknown')}"
+    )
+
+
+@server.tool(
+    title="Delete Message",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_write")
+@handle_http_errors("delete_message", service_type="chat")
+async def delete_message(
+    service,
+    user_google_email: str,
+    message_id: str,
+) -> str:
+    """
+    Deletes a Google Chat message (must be sent by this app/user).
+
+    Args:
+        message_id: The message resource name (e.g. spaces/X/messages/Y).
+
+    Returns:
+        str: Confirmation message.
+    """
+    logger.info(f"[delete_message] Message: '{message_id}'")
+
+    await asyncio.to_thread(
+        service.spaces().messages().delete(name=message_id).execute
+    )
+    return f"Deleted message {message_id}."
+
+
+# ---------------------------------------------------------------------------
+# Memberships: list / get / create / delete
+# ---------------------------------------------------------------------------
+
+
+@server.tool(
+    title="List Space Members",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_memberships_readonly")
+@handle_http_errors("list_members", is_read_only=True, service_type="chat")
+async def list_members(
+    service,
+    user_google_email: str,
+    space_id: str,
+    page_size: int = 100,
+    show_groups: bool = False,
+    show_invited: bool = False,
+    member_filter: Optional[str] = None,
+) -> str:
+    """
+    Lists memberships (members) of a Google Chat space.
+
+    Args:
+        space_id: The space resource name (e.g. spaces/X).
+        page_size: Maximum number of members to return (default 100).
+        show_groups: Include Google Group memberships.
+        show_invited: Include invited-but-not-joined members.
+        member_filter: Optional Chat API filter (e.g. 'member.type = "HUMAN"').
+
+    Returns:
+        str: Formatted list of members.
+    """
+    logger.info(f"[list_members] Space: '{space_id}' for user '{user_google_email}'")
+
+    list_params = {
+        "parent": space_id,
+        "pageSize": page_size,
+        "showGroups": show_groups,
+        "showInvited": show_invited,
+    }
+    if member_filter:
+        list_params["filter"] = member_filter
+
+    response = await asyncio.to_thread(
+        service.spaces().members().list(**list_params).execute
+    )
+    members = response.get("memberships", [])
+    if not members:
+        return f"No members found in space '{space_id}'."
+
+    output = [f"Members of '{space_id}':\n"]
+    for m in members:
+        member = m.get("member", {})
+        group = m.get("groupMember", {})
+        who = member.get("displayName") or member.get("name") or group.get("name", "?")
+        role = m.get("role", "ROLE_UNSPECIFIED")
+        state = m.get("state", "")
+        output.append(
+            f"  - {who} [{member.get('type', 'GROUP') if not group else 'GROUP'}] "
+            f"role={role} state={state} (membership: {m.get('name', '')})"
+        )
+    return "\n".join(output)
+
+
+@server.tool(
+    title="Get Space Member",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_memberships_readonly")
+@handle_http_errors("get_member", is_read_only=True, service_type="chat")
+async def get_member(
+    service,
+    user_google_email: str,
+    membership_id: str,
+) -> str:
+    """
+    Retrieves a single membership by its resource name.
+
+    Args:
+        membership_id: The membership resource name (e.g. spaces/X/members/Y).
+
+    Returns:
+        str: Formatted membership details.
+    """
+    logger.info(f"[get_member] Membership: '{membership_id}'")
+
+    m = await asyncio.to_thread(
+        service.spaces().members().get(name=membership_id).execute
+    )
+    member = m.get("member", {})
+    who = member.get("displayName") or member.get("name", "?")
+    return (
+        f"Membership {m.get('name', membership_id)}:\n"
+        f"  Member: {who} (type={member.get('type', 'unknown')})\n"
+        f"  Role: {m.get('role', 'ROLE_UNSPECIFIED')}\n"
+        f"  State: {m.get('state', 'unknown')}\n"
+        f"  Created: {m.get('createTime', 'unknown')}"
+    )
+
+
+@server.tool(
+    title="Add Space Member",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_memberships")
+@handle_http_errors("create_membership", service_type="chat")
+async def create_membership(
+    service,
+    user_google_email: str,
+    space_id: str,
+    user_name: str,
+) -> str:
+    """
+    Adds a human member to a Google Chat space.
+
+    Args:
+        space_id: The space resource name (e.g. spaces/X).
+        user_name: The user to add, as 'users/{id}' or a bare id/email
+                   (the 'users/' prefix is added automatically).
+
+    Returns:
+        str: Confirmation message.
+    """
+    logger.info(f"[create_membership] Space: '{space_id}', User: '{user_name}'")
+
+    resource = user_name if user_name.startswith("users/") else f"users/{user_name}"
+    body = {"member": {"name": resource, "type": "HUMAN"}}
+
+    membership = await asyncio.to_thread(
+        service.spaces().members().create(parent=space_id, body=body).execute
+    )
+    return (
+        f"Added {resource} to space '{space_id}'. "
+        f"Membership: {membership.get('name', '')}, state={membership.get('state', 'unknown')}"
+    )
+
+
+@server.tool(
+    title="Remove Space Member",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_memberships")
+@handle_http_errors("delete_membership", service_type="chat")
+async def delete_membership(
+    service,
+    user_google_email: str,
+    membership_id: str,
+) -> str:
+    """
+    Removes a member from a Google Chat space.
+
+    Args:
+        membership_id: The membership resource name (e.g. spaces/X/members/Y).
+
+    Returns:
+        str: Confirmation message.
+    """
+    logger.info(f"[delete_membership] Membership: '{membership_id}'")
+
+    await asyncio.to_thread(
+        service.spaces().members().delete(name=membership_id).execute
+    )
+    return f"Removed membership {membership_id}."
+
+
+# ---------------------------------------------------------------------------
+# Spaces: create / setup / update / findDirectMessage
+# ---------------------------------------------------------------------------
+
+
+@server.tool(
+    title="Create Space",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_spaces")
+@handle_http_errors("create_space", service_type="chat")
+async def create_space(
+    service,
+    user_google_email: str,
+    display_name: str,
+    space_type: str = "SPACE",
+    external_user_allowed: bool = False,
+) -> str:
+    """
+    Creates a named Google Chat space.
+
+    Args:
+        display_name: The space's display name.
+        space_type: "SPACE" (named space) or "GROUP_CHAT". Default "SPACE".
+        external_user_allowed: Whether to allow members outside the Workspace org.
+
+    Returns:
+        str: Confirmation with the new space resource name.
+    """
+    logger.info(f"[create_space] Name: '{display_name}', Type: '{space_type}'")
+
+    body = {
+        "displayName": display_name,
+        "spaceType": space_type,
+        "externalUserAllowed": external_user_allowed,
+    }
+    space = await asyncio.to_thread(service.spaces().create(body=body).execute)
+    return (
+        f"Created space '{space.get('displayName', display_name)}'. "
+        f"ID: {space.get('name', '')}"
+    )
+
+
+@server.tool(
+    title="Setup Space With Members",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_spaces")
+@handle_http_errors("setup_space", service_type="chat")
+async def setup_space(
+    service,
+    user_google_email: str,
+    display_name: str,
+    member_user_names: List[str],
+    space_type: str = "SPACE",
+) -> str:
+    """
+    Creates a space and adds members in a single call (spaces.setup).
+
+    Args:
+        display_name: The space's display name.
+        member_user_names: Users to add, each as 'users/{id}' or a bare id/email.
+        space_type: "SPACE" or "GROUP_CHAT". Default "SPACE".
+
+    Returns:
+        str: Confirmation with the new space resource name.
+    """
+    logger.info(
+        f"[setup_space] Name: '{display_name}', Members: {len(member_user_names)}"
+    )
+
+    memberships = []
+    for u in member_user_names:
+        resource = u if u.startswith("users/") else f"users/{u}"
+        memberships.append({"member": {"name": resource, "type": "HUMAN"}})
+
+    body = {
+        "space": {"displayName": display_name, "spaceType": space_type},
+        "memberships": memberships,
+    }
+    space = await asyncio.to_thread(service.spaces().setup(body=body).execute)
+    return (
+        f"Set up space '{space.get('displayName', display_name)}' with "
+        f"{len(memberships)} member(s). ID: {space.get('name', '')}"
+    )
+
+
+@server.tool(
+    title="Update Space",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_spaces")
+@handle_http_errors("update_space", service_type="chat")
+async def update_space(
+    service,
+    user_google_email: str,
+    space_id: str,
+    display_name: Optional[str] = None,
+    space_details_description: Optional[str] = None,
+) -> str:
+    """
+    Updates a Google Chat space's display name and/or description.
+
+    Args:
+        space_id: The space resource name (e.g. spaces/X).
+        display_name: New display name (optional).
+        space_details_description: New description text (optional).
+
+    Returns:
+        str: Confirmation message.
+    """
+    logger.info(f"[update_space] Space: '{space_id}'")
+
+    body: Dict[str, object] = {}
+    update_mask_parts: List[str] = []
+    if display_name is not None:
+        body["displayName"] = display_name
+        update_mask_parts.append("displayName")
+    if space_details_description is not None:
+        body["spaceDetails"] = {"description": space_details_description}
+        update_mask_parts.append("spaceDetails.description")
+
+    if not update_mask_parts:
+        return "Nothing to update: provide display_name and/or space_details_description."
+
+    space = await asyncio.to_thread(
+        service.spaces()
+        .patch(name=space_id, updateMask=",".join(update_mask_parts), body=body)
+        .execute
+    )
+    return f"Updated space {space.get('name', space_id)} ({', '.join(update_mask_parts)})."
+
+
+@server.tool(
+    title="Find Direct Message",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_spaces_readonly")
+@handle_http_errors("find_direct_message", is_read_only=True, service_type="chat")
+async def find_direct_message(
+    service,
+    user_google_email: str,
+    user_name: str,
+) -> str:
+    """
+    Finds the existing direct message (DM) space with a specific user.
+
+    Args:
+        user_name: The other user, as 'users/{id}' or a bare id/email
+                   (the 'users/' prefix is added automatically).
+
+    Returns:
+        str: The DM space resource name, or a not-found message.
+    """
+    logger.info(f"[find_direct_message] User: '{user_name}'")
+
+    resource = user_name if user_name.startswith("users/") else f"users/{user_name}"
+    space = await asyncio.to_thread(
+        service.spaces().findDirectMessage(name=resource).execute
+    )
+    if not space or not space.get("name"):
+        return f"No direct message space found with {resource}."
+    return f"Direct message space with {resource}: {space.get('name')}"
+
+
+# ---------------------------------------------------------------------------
+# Reactions: list / delete    Attachments: get
+# ---------------------------------------------------------------------------
+
+
+@server.tool(
+    title="List Reactions",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_read")
+@handle_http_errors("list_reactions", is_read_only=True, service_type="chat")
+async def list_reactions(
+    service,
+    user_google_email: str,
+    message_id: str,
+    page_size: int = 100,
+    reaction_filter: Optional[str] = None,
+) -> str:
+    """
+    Lists emoji reactions on a Google Chat message.
+
+    Args:
+        message_id: The message resource name (e.g. spaces/X/messages/Y).
+        page_size: Maximum number of reactions to return (default 100).
+        reaction_filter: Optional Chat API filter (e.g. 'emoji.unicode = "👍"').
+
+    Returns:
+        str: Formatted list of reactions.
+    """
+    logger.info(f"[list_reactions] Message: '{message_id}'")
+
+    list_params = {"parent": message_id, "pageSize": page_size}
+    if reaction_filter:
+        list_params["filter"] = reaction_filter
+
+    response = await asyncio.to_thread(
+        service.spaces().messages().reactions().list(**list_params).execute
+    )
+    reactions = response.get("reactions", [])
+    if not reactions:
+        return f"No reactions found on message {message_id}."
+
+    output = [f"Reactions on {message_id}:\n"]
+    for r in reactions:
+        emoji = r.get("emoji", {})
+        symbol = emoji.get("unicode") or f":{emoji.get('customEmoji', {}).get('uid', '?')}:"
+        user = r.get("user", {})
+        who = user.get("displayName") or user.get("name", "?")
+        output.append(f"  - {symbol} by {who} (reaction: {r.get('name', '')})")
+    return "\n".join(output)
+
+
+@server.tool(
+    title="Delete Reaction",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_write")
+@handle_http_errors("delete_reaction", service_type="chat")
+async def delete_reaction(
+    service,
+    user_google_email: str,
+    reaction_id: str,
+) -> str:
+    """
+    Removes an emoji reaction from a Google Chat message.
+
+    Args:
+        reaction_id: The reaction resource name
+                     (e.g. spaces/X/messages/Y/reactions/Z).
+
+    Returns:
+        str: Confirmation message.
+    """
+    logger.info(f"[delete_reaction] Reaction: '{reaction_id}'")
+
+    await asyncio.to_thread(
+        service.spaces().messages().reactions().delete(name=reaction_id).execute
+    )
+    return f"Removed reaction {reaction_id}."
+
+
+@server.tool(
+    title="Get Attachment Metadata",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_read")
+@handle_http_errors("get_attachment", is_read_only=True, service_type="chat")
+async def get_attachment(
+    service,
+    user_google_email: str,
+    attachment_id: str,
+) -> str:
+    """
+    Retrieves metadata for a Google Chat message attachment.
+
+    Args:
+        attachment_id: The attachment resource name
+                       (e.g. spaces/X/messages/Y/attachments/Z).
+
+    Returns:
+        str: Formatted attachment metadata. Use download_chat_attachment to fetch bytes.
+    """
+    logger.info(f"[get_attachment] Attachment: '{attachment_id}'")
+
+    att = await asyncio.to_thread(
+        service.spaces().messages().attachments().get(name=attachment_id).execute
+    )
+    data_ref = att.get("attachmentDataRef", {}).get("resourceName", "")
+    return (
+        f"Attachment {att.get('name', attachment_id)}:\n"
+        f"  Name: {att.get('contentName', 'unnamed')}\n"
+        f"  Type: {att.get('contentType', 'unknown')}\n"
+        f"  Source: {att.get('source', 'unknown')}\n"
+        f"  Data ref: {data_ref or '(none)'}"
+    )

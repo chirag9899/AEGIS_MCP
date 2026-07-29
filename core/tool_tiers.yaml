@@ -105,6 +105,20 @@ chat:
     - find_chat_space
     - get_space
     - download_chat_attachment
+    - get_message
+    - update_message
+    - delete_message
+    - list_members
+    - get_member
+    - create_membership
+    - delete_membership
+    - create_space
+    - setup_space
+    - update_space
+    - find_direct_message
+    - list_reactions
+    - delete_reaction
+    - get_attachment
   complete: []
 
 forms:
