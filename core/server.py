@@ -596,6 +596,21 @@ def configure_server_for_http():
                         "OAuth 2.1: public MCP resource/issuer base URL: %s",
                         public_resource_base,
                     )
+                # First-party clients are already gated by X-Device-Key (nginx-enforced)
+                # + user allowlist + Google's own consent. FastMCP's extra consent screen
+                # is redundant here and its consent-binding cookie was breaking auth
+                # (dropped cross-site cookie → "Consent binding cookie missing", and the
+                # human click exceeded Claude's 60s startup timeout). Disable it by default;
+                # set WORKSPACE_MCP_REQUIRE_CONSENT=true to restore the screen.
+                require_consent = (
+                    os.getenv("WORKSPACE_MCP_REQUIRE_CONSENT", "false").strip().lower()
+                    == "true"
+                )
+                if not require_consent:
+                    logger.info(
+                        "OAuth 2.1: built-in consent screen DISABLED "
+                        "(WORKSPACE_MCP_REQUIRE_CONSENT!=true)"
+                    )
                 provider = WorkspaceGoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
@@ -608,6 +623,7 @@ def configure_server_for_http():
                     client_storage=client_storage,
                     jwt_signing_key=jwt_signing_key,
                     allowed_client_redirect_uris=allowed_client_redirect_uris,
+                    require_authorization_consent=require_consent,
                 )
                 if provider.client_registration_options is not None:
                     # Keep protocol-level auth limited to base identity scopes, but
@@ -936,6 +952,19 @@ async def serve_install_script(request: Request):
         content = script_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return Response("# install script not found", status_code=404, media_type="text/plain")
+    from starlette.responses import Response as _Resp
+    return _Resp(content=content, media_type="text/plain; charset=utf-8")
+
+
+@server.custom_route("/autorepair.sh", methods=["GET"])
+async def serve_autorepair_script(request: Request):
+    """Serve the connector auto-repair installer/uninstaller (macOS launchd agent)."""
+    import pathlib
+    script_path = pathlib.Path(__file__).parent.parent / "scripts" / "autorepair.sh"
+    try:
+        content = script_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Response("# autorepair script not found", status_code=404, media_type="text/plain")
     from starlette.responses import Response as _Resp
     return _Resp(content=content, media_type="text/plain; charset=utf-8")
 

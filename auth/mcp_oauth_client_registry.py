@@ -79,7 +79,14 @@ def get_or_create_stable_oauth_client(
         client_id[:8],
         fingerprint[:20],
     )
-    return {"client_id": client_id, "client_secret": client_secret}
+    # client_secret_post so mcp-remote puts client_id in the token request BODY (the
+    # MCP SDK reads it from the body only; the client_secret_basic default omits it →
+    # "Missing client_id" loop). Written into ~/.aegis/mcp-oauth-client.json by install.
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "token_endpoint_auth_method": "client_secret_post",
+    }
 
 
 async def ensure_oauth_client_registered(

@@ -1983,3 +1983,77 @@ async def get_attachment(
         f"  Source: {att.get('source', 'unknown')}\n"
         f"  Data ref: {data_ref or '(none)'}"
     )
+
+
+@server.tool(
+    title="Search Spaces",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_spaces_readonly")
+@handle_http_errors("search_spaces", is_read_only=True, service_type="chat")
+async def search_spaces(
+    service,
+    user_google_email: str,
+    display_name: Optional[str] = None,
+    order_by: str = "createTime DESC",
+    page_size: int = 50,
+) -> str:
+    """
+    Search/enumerate Google Chat spaces by display name across the org, newest first.
+
+    Uses the Workspace-admin spaces.search endpoint, which surfaces message-less
+    Meet-linked spaces that a normal listing omits — ideal for "latest <name>"
+    queries (e.g. the most recent "Daily Sync"). Falls back to your own visible
+    spaces if admin access is unavailable.
+
+    Args:
+        display_name: Display-name prefix to match, e.g. "Daily Sync". Omit to list
+                      all named spaces.
+        order_by: "createTime DESC" (default, newest first) or "lastActiveTime DESC".
+        page_size: Maximum number of spaces to return.
+
+    Returns:
+        str: Matching spaces with IDs, newest first.
+    """
+    logger.info(
+        f"[search_spaces] Email={user_google_email}, name={display_name!r}, order_by={order_by!r}"
+    )
+    space_filter = f'displayName:"{display_name}"' if display_name else None
+    admin_result = await _list_spaces_admin(
+        service, page_size=page_size, space_filter=space_filter, order_by=order_by
+    )
+    if admin_result is not None:
+        return admin_result
+
+    # Admin access unavailable — best-effort over the caller's own visible spaces.
+    response = await asyncio.to_thread(service.spaces().list(pageSize=page_size).execute)
+    spaces = response.get("spaces", [])
+    if display_name:
+        needle = display_name.lower()
+        spaces = [s for s in spaces if needle in (s.get("displayName") or "").lower()]
+    if order_by:
+        field = order_by.split()[0]
+        if field in ("createTime", "lastActiveTime"):
+            spaces.sort(key=lambda s: s.get(field, ""), reverse="desc" in order_by.lower())
+    if not spaces:
+        note = f" matching '{display_name}'" if display_name else ""
+        return (
+            f"No spaces found{note}. (Admin search unavailable — you may not be a "
+            "Workspace admin — so only your own message-bearing spaces were searched; "
+            "message-less Meet spaces are not visible this way.)"
+        )
+    out = [
+        "(Admin access unavailable — searched only your own spaces, which excludes "
+        "message-less Meet rooms.)"
+    ]
+    for s in spaces[:page_size]:
+        out.append(
+            f"- {s.get('displayName', 'Unnamed')} (ID: {s.get('name', '')}, "
+            f"created: {s.get('createTime', '?')})"
+        )
+    return "\n".join(out)

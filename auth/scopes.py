@@ -175,8 +175,11 @@ CHAT_SCOPES = [
     CHAT_SPACES_SCOPE,
     CHAT_SPACES_READONLY_SCOPE,
     CHAT_ADMIN_SPACES_READONLY_SCOPE,
-    CHAT_MEMBERSHIPS_SCOPE,
-    CHAT_MEMBERSHIPS_READONLY_SCOPE,
+    # NOTE: chat.memberships[.readonly] intentionally NOT requested yet — the app's
+    # Google OAuth consent screen does not list these scopes, so Google drops them
+    # from the granted set, causing an mcp-remote requested-vs-granted mismatch and a
+    # re-auth loop. Re-add here only after the scopes are added to the consent screen
+    # (Google Cloud Console) and re-verified. The member tools remain code-complete.
 ]
 
 SHEETS_SCOPES = [SHEETS_READONLY_SCOPE, SHEETS_WRITE_SCOPE, DRIVE_READONLY_SCOPE]

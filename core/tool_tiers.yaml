@@ -108,10 +108,14 @@ chat:
     - get_message
     - update_message
     - delete_message
-    - list_members
-    - get_member
-    - create_membership
-    - delete_membership
+    # Membership tools are code-complete but NOT enabled yet — they require the
+    # chat.memberships scope, which isn't on the Google OAuth consent screen. Enabling
+    # them re-adds that scope to the request and breaks the OAuth flow (re-auth loop).
+    # Re-enable once the consent screen lists chat.memberships[.readonly].
+    #   - list_members
+    #   - get_member
+    #   - create_membership
+    #   - delete_membership
     - create_space
     - setup_space
     - update_space
@@ -119,6 +123,7 @@ chat:
     - list_reactions
     - delete_reaction
     - get_attachment
+    - search_spaces
   complete: []
 
 forms:

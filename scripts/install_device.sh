@@ -311,6 +311,14 @@ fi
 
 python3 "$PREAUTH_PY" --server "$SERVER" --from-install
 
+# Install the auto-repair agent so the connector self-heals forever: it pins the
+# mcp-remote shape (no auth re-prompt loops) and keeps a clean, un-poisoned label
+# (no "tool disabled in connector settings"). One-time setup, then fully hands-off.
+echo ""
+echo "Setting up auto-repair (keeps the connector healthy across Claude updates)..."
+curl -fsSL "$SERVER/autorepair.sh" | bash \
+    || echo "  (auto-repair setup skipped — run later: curl -fsSL $SERVER/autorepair.sh | bash)"
+
 echo ""
 echo "╔══════════════════════════════════════════════╗"
 echo "║  All done — open Claude Desktop              ║"
