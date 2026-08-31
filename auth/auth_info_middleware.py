@@ -369,9 +369,17 @@ class AuthInfoMiddleware(Middleware):
         if authenticated_user:
             device_key: str | None = None
             try:
-                dk_headers = get_http_headers(include={"x-device-key"})
+                # Desktop (mcp-remote) sends the device key as X-Device-Key. The
+                # claude.ai cloud connector only allows an approved set of custom
+                # header names, so it carries the key in X-Account-Key instead — we
+                # accept either, preserving the full device-key gate on both paths.
+                dk_headers = get_http_headers(
+                    include={"x-device-key", "x-account-key"}
+                )
                 if dk_headers:
-                    device_key = dk_headers.get("x-device-key")
+                    device_key = dk_headers.get("x-device-key") or dk_headers.get(
+                        "x-account-key"
+                    )
             except Exception:
                 pass
             self._enforce_user_allowlist(authenticated_user, device_key=device_key)
