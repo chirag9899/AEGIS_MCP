@@ -969,6 +969,19 @@ async def serve_autorepair_script(request: Request):
     return _Resp(content=content, media_type="text/plain; charset=utf-8")
 
 
+@server.custom_route("/cloud-key.sh", methods=["GET"])
+async def serve_cloud_key_script(request: Request):
+    """Serve the cloud-connector device-key minting helper."""
+    import pathlib
+    script_path = pathlib.Path(__file__).parent.parent / "scripts" / "cloud-key.sh"
+    try:
+        content = script_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Response("# cloud-key script not found", status_code=404, media_type="text/plain")
+    from starlette.responses import Response as _Resp
+    return _Resp(content=content, media_type="text/plain; charset=utf-8")
+
+
 @server.custom_route("/mcp_preauth.sh", methods=["GET"])
 async def serve_mcp_preauth_script(request: Request):
     """Serve one-shot mcp-remote OAuth helper (run with Claude Desktop quit)."""
