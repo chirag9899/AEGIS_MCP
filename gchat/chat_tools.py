@@ -180,6 +180,25 @@ async def _get_space_dict(service, space_id: str) -> dict:
     return await asyncio.to_thread(service.spaces().get(name=resource).execute)
 
 
+async def _verify_dm_membership(chat_service, space_type: str, resource_name: str) -> bool:
+    """Refuse admin-scoped/direct reads of a DM the caller isn't actually in.
+
+    Non-DM spaces (SPACE, GROUP_CHAT) are unaffected. For DIRECT_MESSAGE spaces,
+    membership is checked against the caller's own plain spaces.list() — the
+    non-admin listing, which Chat restricts to spaces the caller actually
+    belongs to even when the caller also holds chat.admin.spaces.readonly.
+    This deliberately avoids requiring chat.memberships.readonly, which isn't
+    part of the app's current OAuth consent.
+    """
+    if space_type != "DIRECT_MESSAGE":
+        return True
+    own_dms = await _fetch_all_spaces(
+        chat_service, filter_param='spaceType = "DIRECT_MESSAGE"'
+    )
+    own_dm_ids = {s.get("name") for s in own_dms}
+    return resource_name in own_dm_ids
+
+
 def _build_admin_search_query(display_name_candidates: List[str]) -> Optional[str]:
     """Build a Workspace-admin spaces.search query from display-name candidates."""
     phrases: List[str] = []
@@ -840,13 +859,21 @@ async def get_messages(
     logger.info(f"[get_messages] Space ID: '{space_id}' for user '{user_google_email}'")
 
     # Get space info first
+    resource_name = normalize_space_resource_name(space_id)
     space_info = await asyncio.to_thread(
-        chat_service.spaces().get(name=space_id).execute
+        chat_service.spaces().get(name=resource_name).execute
     )
     space_name = space_info.get("displayName", "Unknown Space")
+    space_type = space_info.get("spaceType", "")
+
+    if not await _verify_dm_membership(chat_service, space_type, resource_name):
+        return (
+            "This is a private conversation between other people and isn't "
+            "something I have visibility into."
+        )
 
     # Get messages
-    list_params = {"parent": space_id, "pageSize": page_size, "orderBy": order_by}
+    list_params = {"parent": resource_name, "pageSize": page_size, "orderBy": order_by}
     if message_filter is not None:
         list_params["filter"] = message_filter
     response = await asyncio.to_thread(
@@ -1041,7 +1068,15 @@ async def search_messages(
 
     # If specific space provided, search within that space
     if space_id:
-        list_params = {"parent": space_id, "pageSize": page_size}
+        resource_name = normalize_space_resource_name(space_id)
+        space_info = await _get_space_dict(chat_service, resource_name)
+        space_type = space_info.get("spaceType", "")
+        if not await _verify_dm_membership(chat_service, space_type, resource_name):
+            return (
+                "This is a private conversation between other people and isn't "
+                "something I have visibility into."
+            )
+        list_params = {"parent": resource_name, "pageSize": page_size}
         if filter_str:
             list_params["filter"] = filter_str
         response = await _execute_chat_request(

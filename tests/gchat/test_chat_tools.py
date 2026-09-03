@@ -836,3 +836,129 @@ async def test_get_space_parses_url_and_caches(monkeypatch, tmp_path):
     assert "Daily Sync - Jun 11" in result
     saved = json.loads(registry.read_text(encoding="utf-8"))
     assert saved["by_name"]["daily sync jun 11"] == "spaces/AAQA1k9BNCE"
+
+
+# ---------------------------------------------------------------------------
+# get_messages / search_messages: DM membership guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_messages_blocks_dm_the_caller_is_not_a_member_of():
+    """Admin-scoped access must not leak another user's private DM content."""
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/OTHER_DM",
+        "displayName": "",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+    # Caller's own DM list does not include the target space.
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [{"name": "spaces/MY_OWN_DM", "spaceType": "DIRECT_MESSAGE"}]
+    }
+
+    people_service = Mock()
+
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="test@example.com",
+        space_id="spaces/OTHER_DM",
+    )
+
+    assert "isn't something I have visibility into" in result
+    chat_service.spaces().messages().list.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_get_messages_allows_dm_the_caller_is_a_member_of(mock_resolve):
+    """The guard must not block a caller's own, legitimate DM."""
+    mock_resolve.return_value = "Test User"
+    msg = _make_message(text="hi")
+
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/MY_OWN_DM",
+        "displayName": "",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [{"name": "spaces/MY_OWN_DM", "spaceType": "DIRECT_MESSAGE"}]
+    }
+    chat_service.spaces().messages().list().execute.return_value = {"messages": [msg]}
+
+    people_service = Mock()
+
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="test@example.com",
+        space_id="spaces/MY_OWN_DM",
+    )
+
+    assert "isn't something I have visibility into" not in result
+    assert "hi" in result
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_get_messages_non_dm_space_skips_membership_check(mock_resolve):
+    """Regular SPACE/GROUP_CHAT reads must not incur (or require) a membership lookup."""
+    mock_resolve.return_value = "Test User"
+    msg = _make_message(text="team update")
+
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/TEAM_ROOM",
+        "displayName": "Team Room",
+        "spaceType": "SPACE",
+    }
+    chat_service.spaces().messages().list().execute.return_value = {"messages": [msg]}
+
+    people_service = Mock()
+
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="test@example.com",
+        space_id="spaces/TEAM_ROOM",
+    )
+
+    assert "isn't something I have visibility into" not in result
+    assert "team update" in result
+    # No membership lookup should happen for a non-DM space.
+    chat_service.spaces().list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_search_messages_blocks_dm_the_caller_is_not_a_member_of():
+    """search_messages(space_id=...) must apply the same DM guard as get_messages."""
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {
+        "name": "spaces/OTHER_DM",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+    chat_service.spaces().list().execute.return_value = {
+        "spaces": [{"name": "spaces/MY_OWN_DM", "spaceType": "DIRECT_MESSAGE"}]
+    }
+
+    people_service = Mock()
+
+    from gchat.chat_tools import search_messages
+
+    result = await _unwrap(search_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="test@example.com",
+        space_id="spaces/OTHER_DM",
+    )
+
+    assert "isn't something I have visibility into" in result
+    chat_service.spaces().messages().list.assert_not_called()
